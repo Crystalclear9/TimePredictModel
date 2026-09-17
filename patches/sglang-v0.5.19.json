@@ -1,0 +1,8 @@
+{
+  "commit": "0bcd822377da7b5718e674eaf9c870d349424dd1",
+  "upstream_sha256": {
+    "python/sglang/srt/entrypoints/http_server.py": "d8cc81f8d9866957dd4c0aa59917afa3d4d7d0e28eefaff0a9800157ed068a43",
+    "python/sglang/srt/entrypoints/openai/serving_base.py": "3d0613b92abae51e8566a11ae80a2369a46422b49bd63c4cd6aa593d8a4bdbc2",
+    "python/sglang/srt/entrypoints/openai/serving_chat.py": "7b05e6ab1d09a71ce253040c9cd62ea7c55a52020b44cf9b76d91c8df9e23240"
+  }
+}

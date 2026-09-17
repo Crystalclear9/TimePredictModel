@@ -1,0 +1,14 @@
+{
+  "min_supported_rows": 100,
+  "min_effective_samples": 50,
+  "horizons": [2.0],
+  "remaining_ages": [1.0, 2.0],
+  "max_window_calibration_error": 0.1,
+  "max_quantile_coverage_error": 0.05,
+  "max_brier_regression": 0.0,
+  "require_tool_holdout": false,
+  "max_entry_hook_p99_seconds": 0.002,
+  "max_throughput_drop": 0.01,
+  "max_prediction_available_p99_seconds": 0.1,
+  "evidence_max_age_seconds": 604800
+}

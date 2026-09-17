@@ -1,0 +1,352 @@
+import asyncio
+import contextlib
+import json
+import logging
+import math
+import secrets
+import time
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field
+from redis.exceptions import ResponseError
+
+from .clock import Clock, elapsed
+from .distribution import LogNormal, UnreliableDistribution
+from .model import Model
+from .state import compact
+from .freshness import observation_status, PROCESSOR_TTL
+from .metrics import Histograms
+
+logger = logging.getLogger(__name__)
+
+
+def window_rows(state, stamp, horizon, tenant=None):
+    rows = []
+    for gen in state["pending"].values():
+        record = state["records"][gen]
+        if tenant is not None and record["tenant"] != tenant:
+            continue
+        row = {k: record[k] for k in ("key", "generation", "tenant", "workflow_id", "agent_id", "revision")}
+        row.update(status=record["prediction_status"], in_window=False, distribution=record["prediction"])
+        reason, ttl = observation_status(state, record, stamp)
+        row["valid_for_seconds"] = ttl
+        row["expires_at_utc"] = stamp["utc"] + ttl
+        if reason:
+            row.update(status="unknown", reason=reason)
+            rows.append(row)
+            continue
+        try:
+            age = elapsed(record["out"], stamp)
+            row["age_seconds"] = age
+            prediction = record["prediction"]
+            if prediction and record["prediction_status"] == "ready":
+                row.update(LogNormal(prediction["mu"], prediction["sigma"]).summarize(age, horizon))
+                row["model_version"] = prediction["model_version"]
+                row["in_window"] = row["remaining_p50_seconds"] <= horizon and not prediction.get("shadow", False)
+                row["shadow"] = prediction.get("shadow", False)
+            elif row["status"] != "pending_prediction":
+                row["reason"], row["status"] = row["status"], "unknown"
+        except (ValueError, UnreliableDistribution) as exc:
+            row.update(status="unknown", reason=str(exc))
+        rows.append(row)
+    return {"snapshot_utc": stamp["utc"], "revision": state["revision"], "H_seconds": horizon, "records": rows}
+
+
+class Worker:
+    def __init__(self, store, model_dir=None, clock=None, horizon=2., refresh=0.1, heartbeat_ttl=30, shadow=False):
+        self.store, self.model_dir, self.clock = store, model_dir, clock or Clock()
+        self.horizon, self.refresh, self.heartbeat_ttl = horizon, refresh, heartbeat_ttl
+        self.model = None
+        self.shadow = shadow
+        self.inflight = set()
+        self.prediction_tasks = set()
+        self.semaphore = asyncio.Semaphore(4)
+        self.metrics = {"events": 0, "prediction_errors": 0, "predictions": 0, "redis_errors": 0}
+        self.last_error = None
+        self.histograms = Histograms()
+        self.clock_task = None
+
+    async def maintain_clock(self):
+        while True:
+            await asyncio.to_thread(self.clock.refresh)
+            await asyncio.sleep(1)
+
+    async def supervise(self):
+        while True:
+            try:
+                await self.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                logger.exception("worker restarting after failure")
+                await asyncio.sleep(2)
+
+    async def predict_one(self, record):
+        generation = record["generation"]
+        started = time.monotonic()
+        try:
+            async with self.semaphore:
+                self.histograms.observe("prediction_task_queue_seconds", time.monotonic()-started)
+                compute_started = time.monotonic()
+                if self.model:
+                    for attempt in range(3):
+                        try:
+                            prediction, status = await asyncio.to_thread(self.model.predict, record["call"])
+                            break
+                        except (TimeoutError, ConnectionError):
+                            self.metrics["prediction_errors"] += 1
+                            if attempt == 2:
+                                prediction, status = None, "prediction_dependency_unavailable"
+                            else:
+                                await asyncio.sleep(0.1 * 2**attempt)
+                        except Exception:
+                            self.metrics["prediction_errors"] += 1
+                            logger.exception("prediction failed permanently")
+                            prediction, status = None, "prediction_error"
+                            break
+                else:
+                    prediction, status = None, "model_unavailable"
+                self.histograms.observe("prediction_compute_seconds", time.monotonic()-compute_started)
+                if prediction:
+                    prediction["shadow"] = self.shadow
+                _, applied = await self.store.prediction(generation, prediction, status, self.clock.stamp())
+                if not applied:
+                    return  # Returned/cancelled/replaced while CPU inference was running.
+                completed = self.clock.stamp()
+                try:
+                    self.histograms.observe("prediction_available_seconds", elapsed(record["out"], completed))
+                except ValueError:
+                    self.metrics["latency_clock_unknown"] = self.metrics.get("latency_clock_unknown", 0)+1
+                self.metrics["predictions"] += 1
+                self.metrics["last_prediction_seconds"] = time.monotonic() - started
+        except Exception:
+            self.metrics["prediction_errors"] += 1
+            logger.exception("prediction failed")
+        finally:
+            self.inflight.discard(generation)
+
+    async def consume(self):
+        redis = self.store.redis
+        try:
+            await redis.xgroup_create(self.store.events, "predictor", id="0", mkstream=True)
+        except ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+        consumer = uuid.uuid4().hex
+        while True:
+            try:
+                claimed = await redis.xautoclaim(self.store.events, "predictor", consumer, 10000, "0-0", count=100)
+                messages = claimed[1]
+                if not messages:
+                    batches = await redis.xreadgroup("predictor", consumer, {self.store.events: ">"}, count=100, block=500)
+                    messages = [item for _, batch in batches for item in batch]
+                for event_id, fields in messages:
+                    event = json.loads(fields["data"])
+                    event["observed_at"] = time.time()
+                    try:
+                        self.histograms.observe("event_delivery_seconds", elapsed(event["stamp"], self.clock.stamp()))
+                    except ValueError:
+                        pass
+                    await self.store.apply(event)
+                    await redis.xack(self.store.events, "predictor", event_id)
+                    self.metrics["events"] += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.metrics["redis_errors"] += 1
+                logger.exception("event consumer failure")
+                await asyncio.sleep(1)
+
+    async def tick(self):
+        last_load = 0.
+        last_compact = 0.
+        while True:
+            try:
+                if self.model_dir and time.monotonic() - last_load > 5:
+                    last_load = time.monotonic()
+                    try:
+                        self.model = await asyncio.to_thread(Model, self.model_dir, require_promoted=not self.shadow)
+                    except (OSError, ValueError):
+                        logger.warning("no compatible model; retaining last good model")
+                state = await self.store.read()
+                now = self.clock.stamp()
+                for source_id, source in state["sources"].items():
+                    if not source.get("lost") and not source.get("retired") and now["utc"]-source["last"]["utc"] > self.heartbeat_ttl:
+                        await self.store.apply({"kind": "source_lost", "event_id": uuid.uuid4().hex, "stamp": now, "lost_source": source_id, "last_seen": source["last"]["utc"]})
+                if time.monotonic()-last_compact > 60:
+                    await self.store.mutate(lambda s: compact(s, now["utc"]))
+                    last_compact = time.monotonic()
+                for gen in list(state["pending"].values()):
+                    record = state["records"][gen]
+                    source = state["sources"].get(record["out"]["source"] + "/" + record["out"]["boot"], {})
+                    last_source = source.get("last", record["out"])["utc"]
+                    last_agent = state["heartbeats"].get(record["key"], record["out"]["utc"])
+                    if now["utc"] - min(last_source, last_agent) > self.heartbeat_ttl:
+                        await self.store.apply({"kind": "expire", "event_id": uuid.uuid4().hex, "stamp": now,
+                                                "tenant": record["tenant"], "workflow_id": record["workflow_id"], "agent_id": record["agent_id"], "generation": gen})
+                    elif record["prediction_status"] == "pending_prediction" and gen not in self.inflight and len(self.inflight) < 64:
+                        self.inflight.add(gen)
+                        task = asyncio.create_task(self.predict_one(record))
+                        self.prediction_tasks.add(task)
+                        task.add_done_callback(self.prediction_tasks.discard)
+                # Every refresh is a versioned snapshot; transitions and snapshots share one CAS domain.
+                def refresh(state):
+                    state["processor"] = now
+                    view = window_rows(state, now, self.horizon)
+                    notices = []
+                    for row in view["records"]:
+                        state["revision"] += 1
+                        record = state["records"][row["generation"]]
+                        row["revision"] = record["revision"] = state["revision"]
+                        notices.append({"action": "candidate_update", "tenant": row["tenant"], "key": row["key"],
+                                        "generation": row["generation"], "revision": row["revision"], "H_seconds": self.horizon,
+                                        "snapshot_utc": now["utc"], "candidate": row})
+                    return state, notices
+                await self.store.mutate(refresh)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("refresh failed")
+            await asyncio.sleep(self.refresh)
+
+    async def run(self):
+        clock_task = asyncio.create_task(self.maintain_clock())
+        try:
+            await self.run_elected()
+        finally:
+            clock_task.cancel()
+            await asyncio.gather(clock_task, return_exceptions=True)
+
+    async def run_elected(self):
+        # A single elected worker preserves per-source ordering; API replicas remain stateless.
+        lease = self.store.prefix + ":worker-lease"
+        token = uuid.uuid4().hex
+        while not await self.store.redis.set(lease, token, nx=True, px=15000):
+            await asyncio.sleep(2)
+        self.store.required_lease = (lease, token)
+        self.last_error = None
+        async def renew():
+            while True:
+                await asyncio.sleep(3)
+                ok = await self.store.redis.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('pexpire',KEYS[1],15000) else return 0 end", 1, lease, token)
+                if not ok:
+                    raise RuntimeError("worker lease lost")
+        tasks = [asyncio.create_task(self.consume()), asyncio.create_task(self.tick()), asyncio.create_task(renew())]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks + list(self.prediction_tasks):
+                task.cancel()
+            await asyncio.gather(*tasks, *self.prediction_tasks, return_exceptions=True)
+            self.store.required_lease = None
+            with contextlib.suppress(Exception):
+                await self.store.redis.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end", 1, lease, token)
+
+
+class Lifecycle(BaseModel):
+    workflow_id: str = Field(min_length=1, max_length=256)
+    agent_id: str = Field(default="*", min_length=1, max_length=256)
+
+
+def create_app(store, tokens, clock=None, worker=None):
+    if not tokens:
+        raise ValueError("at least one authentication token is required")
+    clock = clock or Clock()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async def api_clock():
+            while True:
+                await asyncio.to_thread(clock.refresh)
+                await asyncio.sleep(1)
+        task = asyncio.create_task(worker.supervise() if worker else api_clock())
+        try:
+            yield
+        finally:
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    app = FastAPI(title="Tool return prediction", lifespan=lifespan)
+
+    async def tenant(authorization: str = Header(default="")):
+        token = authorization.removeprefix("Bearer ")
+        for expected, namespace in tokens.items():
+            if secrets.compare_digest(token, expected) and authorization.startswith("Bearer "):
+                return namespace
+        raise HTTPException(401, "invalid credential")
+
+    @app.get("/internal/window")
+    async def window(H_seconds: float = Query(gt=0, allow_inf_nan=False), namespace=Depends(tenant)):
+        try:
+            # Read cursor first: any concurrent changes will either be in the snapshot or replayed.
+            last_notice = await store.redis.xrevrange(store.notices, count=1)
+            state = await store.read()
+        except Exception as exc:
+            raise HTTPException(503, "state unavailable") from exc
+        result = await asyncio.to_thread(window_rows, state, clock.stamp(), H_seconds, namespace)
+        result["notice_cursor"] = last_notice[0][0] if last_notice else "0-0"
+        return result
+
+    @app.post("/internal/lifecycle/{action}")
+    async def lifecycle(action: str, body: Lifecycle, namespace=Depends(tenant)):
+        if action not in ("heartbeat", "cancel", "terminate"):
+            raise HTTPException(404, "unknown lifecycle action")
+        if action in ("cancel", "heartbeat") and body.agent_id == "*":
+            raise HTTPException(422, "cancel and heartbeat require agent_id")
+        event = {"event_id": uuid.uuid4().hex, "kind": action, "stamp": clock.stamp(), "tenant": namespace, **body.model_dump()}
+        try:
+            await store.redis.xadd(store.events, {"data": json.dumps(event)})
+        except Exception as exc:
+            raise HTTPException(503, "event transport unavailable") from exc
+        return {"accepted": True, "event_id": event["event_id"]}
+
+    @app.get("/internal/notices")
+    async def notices(after: str = "0-0", limit: int = Query(default=100, ge=1, le=1000), namespace=Depends(tenant)):
+        if not __import__("re").fullmatch(r"\d+-\d+", after):
+            raise HTTPException(422, "invalid stream cursor")
+        messages = await store.redis.xrange(store.notices, min="(" + after, max="+", count=limit)
+        now = clock.stamp()
+        events = []
+        for ident, fields in messages:
+            item = json.loads(fields["data"])
+            if item["tenant"] != namespace:
+                continue
+            candidate = item.get("candidate")
+            if candidate:
+                # Never replay an expired actionable lease from the history stream.
+                left = candidate.get("expires_at_utc", 0)-now["utc"]-0.005
+                if left <= 0 or now.get("error") is None or now.get("jumped"):
+                    candidate.update(status="unknown", reason="expired_notice", in_window=False, valid_for_seconds=0.)
+                else:
+                    candidate["valid_for_seconds"] = min(candidate.get("valid_for_seconds", 0), left)
+            events.append({"id": ident, **item})
+        return {"cursor": messages[-1][0] if messages else after,
+                "events": events}
+
+    @app.get("/internal/health")
+    async def health(namespace=Depends(tenant)):
+        try:
+            await store.redis.ping()
+        except Exception as exc:
+            raise HTTPException(503, "Redis unavailable") from exc
+        state = await store.read()
+        now = clock.stamp()
+        try:
+            fresh = elapsed(state["processor"], now) <= PROCESSOR_TTL
+        except (ValueError, KeyError):
+            fresh = False
+        return {"status": "ok" if fresh else "degraded", "metrics": worker.metrics if worker else {}, "clock": now,
+                "store_metrics": store.metrics,
+                "processor": state.get("processor"),
+                "latency_seconds": worker.histograms.snapshot() if worker else {},
+                "worker_last_error": worker.last_error if worker else None,
+                "sources": {key: {"bad": value.get("bad", False), "retired": value.get("retired", False), "last": value["last"], "telemetry": value.get("telemetry", {})} for key, value in state["sources"].items()},
+                "model_version": worker.model.version if worker and worker.model else None}
+
+    return app

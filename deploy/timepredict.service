@@ -1,0 +1,17 @@
+[Unit]
+Description=SGLang tool return predictor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=timepredict
+WorkingDirectory=/opt/timepredict
+EnvironmentFile=/etc/timepredict/service.env
+ExecStart=/opt/timepredict/.venv/bin/timepredict serve --host 127.0.0.1 --port 8098 --window-h 2 --models /var/lib/timepredict/models --tokens-file /etc/timepredict/tokens.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

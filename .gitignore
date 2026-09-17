@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+artifacts/
+vendor/
+dist/
+.env
+events.jsonl
+samples.jsonl
+candidates/
+models/
+holdout-candidates/
+server-acceptance.json
+scale-acceptance.json
+failover.json
