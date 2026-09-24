@@ -9,10 +9,40 @@ from scipy.optimize import minimize
 from scipy.special import log_ndtr, ndtr, ndtri
 
 from .clock import elapsed
-from .dataset import validate_rows, describe
+from .dataset import validate_rows, describe, validate_label_provenance
 from .features import FeatureSpec, UnsupportedInput, extract
 from .model import publish, versions
 from .state import empty_state, reduce_event, workflow_key
+from .actions import ActionFamilies
+
+
+def _curve_svg(series, title):
+    """Small dependency-free SVG plot retained with the best candidate."""
+    width, height, left, top, right, bottom = 900, 500, 70, 55, 25, 55
+    points = [(name, [float(v) for v in values if v is not None and math.isfinite(float(v))]) for name, values in series.items() if values and any(v is not None for v in values)]
+    length = max((len(v) for _, v in points), default=1)
+    values = [x for _, v in points for x in v if math.isfinite(x)] or [0.0, 1.0]
+    low, high = min(values), max(values)
+    if high <= low:
+        high = low + 1.0
+    def path(values):
+        coords = []
+        for i, value in enumerate(values):
+            x = left + (width-left-right) * (i / max(1, length-1))
+            y = top + (height-top-bottom) * (high-value) / (high-low)
+            coords.append(f"{x:.2f},{y:.2f}")
+        return "M " + " L ".join(coords)
+    colors = ("#2563eb", "#dc2626", "#16a34a", "#9333ea")
+    lines = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+             '<rect width="100%" height="100%" fill="white"/>', f'<text x="{left}" y="30" font-size="20">{title}</text>',
+             f'<line x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}" stroke="#111"/>',
+             f'<line x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}" stroke="#111"/>']
+    for index, (name, vals) in enumerate(points):
+        color = colors[index % len(colors)]
+        lines.append(f'<path d="{path(vals)}" fill="none" stroke="{color}" stroke-width="2"/>')
+        lines.append(f'<text x="{left + index*170}" y="{height-18}" fill="{color}" font-size="14">{name}</text>')
+    lines.append("</svg>")
+    return "\n".join(lines)
 
 
 def snapshot(events, cutoff, heartbeat_ttl=30):
@@ -81,10 +111,10 @@ def split_rows(rows):
     return groups
 
 
-def matrix(rows, spec):
+def matrix(rows, spec, time_scale=1.0):
     data = xgb.DMatrix(np.stack([spec.transform(row["call"]) for row in rows]))
-    data.set_float_info("label_lower_bound", np.array([r["lower"] for r in rows]))
-    data.set_float_info("label_upper_bound", np.array([r["upper"] for r in rows]))
+    data.set_float_info("label_lower_bound", np.array([r["lower"] * time_scale for r in rows]))
+    data.set_float_info("label_upper_bound", np.array([r["upper"] * time_scale for r in rows]))
     return data
 
 
@@ -163,6 +193,39 @@ def evaluate(rows, mu, sigma, horizons=(1., 2., 5., 10.)):
     return result
 
 
+def point_accuracy(rows, prediction, tolerances=(0.1, 0.2, 0.5)):
+    if any(not math.isfinite(r["upper"]) for r in rows):
+        return {str(t): None for t in tolerances}
+    target = np.asarray([r["lower"] for r in rows], dtype=float)
+    prediction = np.broadcast_to(np.asarray(prediction, dtype=float), target.shape)
+    relative = np.abs(prediction - target) / target
+    return {str(t): float(np.mean(relative <= t)) for t in tolerances}
+
+
+def accuracy_curve(rows, booster, spec, best_iteration, sigma=0.5, time_scale=1.0):
+    if any(not math.isfinite(row["upper"]) for row in rows):
+        return {"status": "unsupported_censored_labels", "tolerances": [0.1, 0.2, 0.5]}
+    data = matrix(rows, spec, time_scale)
+    target = np.asarray([row["lower"] * time_scale for row in rows], dtype=np.float64)
+    curves = {f"{q}_{t}": [] for q in (0.5, 0.9) for t in (0.1, 0.2, 0.5)}
+    for iteration in range(1, booster.num_boosted_rounds() + 1):
+        mu = booster.predict(data, output_margin=True, iteration_range=(0, iteration))
+        for q in (0.5, 0.9):
+            relative = np.abs(np.exp(mu + sigma * ndtri(q)) - target) / target
+            for tolerance in (0.1, 0.2, 0.5):
+                curves[f"{q}_{tolerance}"].append(float(np.mean(relative <= tolerance)))
+    return {"status": "ok", "tolerances": [0.1, 0.2, 0.5], "best_round": best_iteration + 1,
+            "curves": curves, "best_round_accuracy": {t: values[best_iteration] for t, values in curves.items()}}
+
+
+def family_priors(rows):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row["call"].get("action_family", row["call"]["name"])].append(math.log(row["lower"]))
+    return {name: {"mu": float(np.median(values)), "sigma": max(float(np.std(values)), 0.25), "rows": len(values)}
+            for name, values in grouped.items()}
+
+
 def baseline_reports(train, test):
     def fit(rows):
         logs = np.log([r["lower"] for r in rows])
@@ -184,14 +247,20 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
     rows = validate_rows(rows)
     if threads <= 0 or rounds <= 0 or not sigmas or any(not math.isfinite(s) or s <= 0 for s in sigmas):
         raise ValueError("threads, rounds and sigma values must be positive")
-    if data_kind not in ("observed", "synthetic", "unspecified"):
+    if data_kind not in ("observed", "proxy", "synthetic", "unspecified"):
         raise ValueError("invalid data_kind")
+    label_kinds = {r.get("label_kind", "observed") for r in rows}
+    if len(label_kinds) > 1:
+        raise ValueError("mixed_label_kinds_rejected")
+    # Provenance is checked before feature fitting.  In particular, a caller
+    # may not manufacture formal observations by selecting data_kind=observed.
+    validate_label_provenance(rows, data_kind=data_kind, production=False)
     groups = split_rows(rows)
     held = set(holdout_tools)
     if held:
         # Quarantine whole workflows that contain a held-out tool, not just their tool rows.
-        workflows = {r["workflow"] for r in rows if r["call"]["name"] in held}
-        unseen = [r for r in rows if r["workflow"] in workflows and r["call"]["name"] in held]
+        workflows = {r["workflow"] for r in rows if r["call"].get("action_family", r["call"]["name"]) in held or r["call"]["name"] in held}
+        unseen = [r for r in rows if r["workflow"] in workflows and (r["call"].get("action_family", r["call"]["name"]) in held or r["call"]["name"] in held)]
         for name in ("train", "validation", "test"):
             groups[name] = [r for r in groups[name] if r["workflow"] not in workflows]
         if any(not groups[k] for k in ("train", "validation", "test")):
@@ -201,27 +270,82 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
     for name in ("train", "validation"):
         if not any(math.isfinite(r["upper"]) for r in groups[name]):
             raise ValueError(name+" has no observed returns; collect complete observations before fitting")
+    action_families = ActionFamilies.fit(r["call"] for r in groups["train"])
+    for bucket in groups.values():
+        for row in bucket:
+            row["call"] = action_families.enrich(row["call"])
     spec = FeatureSpec.fit(r["call"] for r in groups["train"])
-    train_data, validation = matrix(groups["train"], spec), matrix(groups["validation"], spec)
+    # Public traces contain microsecond-scale spans. Train in microseconds to
+    # keep XGBoost AFT away from denormal floating-point values, then shift the
+    # returned margin back to seconds for all reports and serving.
+    time_scale = 1e6
+    train_data, validation = matrix(groups["train"], spec, time_scale), matrix(groups["validation"], spec, time_scale)
     candidates = []
     for sigma in sigmas:
         params = {"objective": "survival:aft", "eval_metric": "aft-nloglik", "aft_loss_distribution": "normal",
                   "aft_loss_distribution_scale": sigma, "tree_method": "hist", "max_depth": 4,
                   "eta": 0.05, "seed": 42, "nthread": threads, "device": "cpu"}
-        booster = xgb.train(params, train_data, num_boost_round=rounds, evals=[(validation, "validation")], early_stopping_rounds=30, verbose_eval=False)
-        candidates.append((float(booster.best_score), sigma, booster))
-    _, sigma, booster = min(candidates, key=lambda v: v[0])
+        evals_result = {}
+        booster = xgb.train(params, train_data, num_boost_round=rounds, evals=[(train_data, "train"), (validation, "validation")],
+                            evals_result=evals_result, early_stopping_rounds=30, verbose_eval=False)
+        candidates.append((float(booster.best_score), sigma, booster, evals_result))
+    _, sigma, booster, evals_result = min(candidates, key=lambda v: v[0])
+    def predict(data):
+        return booster.predict(matrix(data, spec), output_margin=True, iteration_range=(0, booster.best_iteration+1)) - math.log(time_scale)
     def assess(data):
-        mu = booster.predict(matrix(data, spec), output_margin=True, iteration_range=(0, booster.best_iteration+1))
-        return evaluate(data, mu, sigma)
-    report = {"split_counts": {k: len(v) for k,v in groups.items()}, "validation": assess(groups["validation"]),
+        return evaluate(data, predict(data), sigma)
+    tree_validation = assess(groups["validation"])
+    report = {"split_counts": {k: len(v) for k,v in groups.items()}, "validation": tree_validation,
               "test": assess(groups["test"]), "baselines": baseline_reports(groups["train"], groups["test"]),
-              "sigma_trials": [{"sigma": s, "validation_nll": score} for score,s,_ in candidates],
-              "dependencies": versions(), "threads": threads, "seed": 42, "data_kind": data_kind,
+              "sigma_trials": [{"sigma": s, "validation_nll": score} for score,s,_,_ in candidates],
+              "time_scale": time_scale,
+              "training_curve": evals_result, "dependencies": versions(), "threads": threads, "seed": 42,
+              "data_kind": data_kind, "label_kinds": dict(Counter(r.get("label_kind", "observed") for r in rows)),
               "data_digest": dataset_digest(rows), "dataset": describe(rows),
               "unknown_tool_test": assess(unseen) if unseen else {"status": "not_run", "reason": "pass --holdout-tool"},
-              "promotion": "candidate; explicit quality-gated promote required"}
-    return publish(output, booster, spec, sigma, booster.best_iteration, report), report
+              "prediction_mode": "xgboost_aft", "family_priors": {}, "embedding_kind": spec.embedding_kind,
+              "embedding_model": spec.embedding_model, "embedding_dim": spec.embedding_dim,
+              "dataset_revision": next((row.get("dataset_revision") for row in rows if row.get("dataset_revision")), None),
+              "converter_version": next((row.get("converter_version") for row in rows if row.get("converter_version")), None),
+              "validation_model_nll": tree_validation["nll"], "promotion": "candidate; explicit quality-gated promote required"}
+    curve = _curve_svg({name: values.get("aft-nloglik", []) for name, values in evals_result.items()}, "AFT training and validation negative log-likelihood")
+    test_mu = predict(groups["test"]); selected_sigma = sigma
+    train_median = float(np.median([r["lower"] for r in groups["train"]]))
+    report["point_accuracy"] = {"definition": "relative absolute error of exp(AFT margin) P50",
+                                 "model": point_accuracy(groups["test"], np.exp(test_mu)),
+                                 "global_median_baseline": point_accuracy(groups["test"], train_median),
+                                 "baseline_median_seconds": train_median}
+    report["accuracy_curves"] = {"train": accuracy_curve(groups["train"], booster, spec, booster.best_iteration, sigma, time_scale),
+                                  "validation": accuracy_curve(groups["validation"], booster, spec, booster.best_iteration, sigma, time_scale),
+                                  "test": accuracy_curve(groups["test"], booster, spec, booster.best_iteration, sigma, time_scale)}
+    q_grid = np.arange(0.1, 1.0, 0.1)
+    q_actual = []
+    for q in q_grid:
+        score = ipcw_score(groups["test"], np.full(len(groups["test"]), q), np.exp(test_mu + selected_sigma * ndtri(q)))
+        q_actual.append(score["weighted_actual"] if score["weighted_actual"] is not None else None)
+    q_pred = list(q_grid)
+    horizons = (0.5, 1., 2., 5., 10.)
+    w_pred = [float(ndtr((np.log(h)-test_mu)/selected_sigma).mean()) for h in horizons]
+    w_actual = []
+    for h, p in zip(horizons, w_pred):
+        score = ipcw_score(groups["test"], np.full(len(groups["test"]), p), np.full(len(groups["test"]), h))
+        w_actual.append(score.get("weighted_actual"))
+    artifacts = {
+        "dataset-manifest.json": json.dumps({"dataset": report["dataset"],
+                                               "revision": report.get("dataset_revision"),
+                                               "converter_version": report.get("converter_version"),
+                                               "source_hash_kind": "normalized_rows_sha256",
+                                               "data_digest": report["data_digest"],
+                                               "label_kinds": report["label_kinds"],
+                                               "data_kind": data_kind}, ensure_ascii=False, sort_keys=True),
+        "quantile_coverage.svg": _curve_svg({"predicted": q_pred, "observed": q_actual}, "Quantile coverage (IPCW observed)"),
+        "window_calibration.svg": _curve_svg({"predicted": w_pred, "observed": w_actual}, "Window return probability calibration"),
+        "accuracy_curve.svg": _curve_svg({"train_20pct": report["accuracy_curves"]["train"].get("curves", {}).get("0.5_0.2", []),
+                                           "validation_20pct": report["accuracy_curves"]["validation"].get("curves", {}).get("0.5_0.2", [])},
+                                          "Relative accuracy (error <= 20%)"),
+    }
+    return publish(output, booster, spec, sigma, booster.best_iteration, report, action_families=action_families,
+                   prediction_mode="xgboost_aft", family_priors={}, curve_svg=curve, artifacts=artifacts), report
 
 
 def load_rows(path):

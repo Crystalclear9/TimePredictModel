@@ -4,8 +4,9 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 
 import numpy as np
+from .semantic import SemanticEncoder
 
-VERSION = 1
+VERSION = 3
 MAX_BYTES = 256 * 1024
 MAX_DEPTH = 32
 
@@ -45,7 +46,7 @@ def parse_arguments(arguments):
 
 def extract(call):
     args = parse_arguments(call["arguments"])
-    tool = call["name"]
+    tool = call.get("action_family", call["name"])
     fields, stats = {}, Counter()
     stats["json_bytes"] = len(canonical(args).encode("utf-8"))
 
@@ -117,6 +118,11 @@ class FeatureSpec:
     tools: list[str]
     fields: list[str]
     version: int = VERSION
+    embedding_dim: int = 384
+    embedding_version: int = 3
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_revision: str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+    embedding_kind: str = "sentence_transformers"
 
     @classmethod
     def fit(cls, calls, max_fields=4096):
@@ -124,15 +130,31 @@ class FeatureSpec:
         for call in calls:
             fields, _ = extract(call)
             counts.update(fields.keys())
-            tools.add(call["name"])
-        return cls(sorted(tools), sorted(counts, key=lambda k: (-counts[k], k))[:max_fields])
+            tools.add(call.get("action_family", call["name"]))
+        encoder = SemanticEncoder()
+        spec = cls(sorted(tools), sorted(counts, key=lambda k: (-counts[k], k))[:max_fields],
+                   embedding_dim=encoder.dim, embedding_model=encoder.model_name,
+                   embedding_revision=encoder.revision, embedding_kind=encoder.backend)
+        object.__setattr__(spec, "_encoder", encoder)
+        return spec
 
     def transform(self, call):
         if self.version != VERSION:
             raise ValueError("feature_version_mismatch")
         fields, stats = extract(call)
-        values = [float(call["name"] == t) for t in self.tools]
-        values += [float(call["name"] not in self.tools)]
+        action = call.get("action_family", call["name"])
+        values = [float(action == t) for t in self.tools]
+        values += [float(action not in self.tools)]
+        encoder = getattr(self, "_encoder", None)
+        if encoder is None:
+            encoder = SemanticEncoder(self.embedding_model, revision=self.embedding_revision,
+                                      device="cpu")
+            if encoder.dim != self.embedding_dim or encoder.backend != self.embedding_kind:
+                raise ValueError("embedding_dimension_mismatch")
+            object.__setattr__(self, "_encoder", encoder)
+        if encoder.dim != self.embedding_dim or encoder.backend != self.embedding_kind:
+            raise ValueError("embedding_dimension_mismatch")
+        values += encoder.encode(call).tolist()
         values += [float(stats[k]) for k in STATS]
         values += [fields.get(k, float("nan")) for k in self.fields]
         return np.asarray(values, dtype=np.float32)

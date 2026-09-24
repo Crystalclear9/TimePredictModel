@@ -121,9 +121,11 @@ def accepted(request, raw_request):
     identity["tenant"] = hashlib.sha256(credential[7:].encode()).hexdigest()
     data = request.model_dump(exclude_none=True)
     tools = {t["function"]["name"]: t["function"] for t in data.get("tools", []) if t.get("type") == "function"}
-    capture = Capture(identity, tools, data.get("n", 1) == 1)
+    capture = Capture(identity, tools, data.get("n", 1) == 1 and data.get("parallel_tool_calls", False) is False)
     state["timepredict_capture"] = capture
-    observer.emit("ingress", {**identity, "latest_tool_ids": latest_tool_ids(data.get("messages", []))}, state["timepredict_received"])
+    latest_ids = latest_tool_ids(data.get("messages", []))
+    observer.emit("ingress", {**identity, "latest_tool_ids": latest_ids,
+                                "tool_call_ids_present": bool(latest_ids)}, state["timepredict_received"])
 
 
 @safe_hook
@@ -188,6 +190,11 @@ class ObservationMiddleware:
             terminal = success and capture and message["type"] == "http.response.body" and (
                 b"data: [DONE]" in message.get("body", b"") if streaming else not message.get("more_body", False))
             stamp = self.publisher.clock.stamp() if terminal else None
+            if terminal and capture and not state.get("timepredict_prepared"):
+                prepared = capture.payload()
+                if prepared:
+                    self.publisher.emit("prepared", prepared, stamp)
+                    state["timepredict_prepared"] = True
             try:
                 await send(message)
             except BaseException:
@@ -216,8 +223,9 @@ class ObservationMiddleware:
                 capture.completed = True
 
 
-def install(app):
+def install(app, server_args):
     if os.environ.get("TIMEPREDICT_REDIS_URL"):
-        if not getattr(app, "is_single_tokenizer_mode", False):
+        worker_count = getattr(server_args, "tokenizer_worker_num", None)
+        if worker_count != 1:
             raise ValueError("timepredict requires one authenticated HTTP worker per replica; deploy multiple replicas for multiple ingress")
         app.add_middleware(ObservationMiddleware)

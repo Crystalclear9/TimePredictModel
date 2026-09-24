@@ -6,7 +6,7 @@
  
 +        from timepredict.sglang import install as install_timepredict
 +
-+        install_timepredict(app)
++        install_timepredict(app, server_args)
 +
          # Listen for HTTP requests
          if server_args.tokenizer_worker_num == 1:

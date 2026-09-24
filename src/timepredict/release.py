@@ -16,6 +16,17 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def _fsync_directory(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def evaluate_gate(report, evidence, policy, version):
     failures = []
     def require(test, label):
@@ -49,6 +60,7 @@ def evaluate_gate(report, evidence, policy, version):
         if finite(actual) and finite(predicted):
             require(abs(actual-predicted) <= tolerance, label+": calibration error")
     require(report.get("data_kind") == "observed", "training provenance must be observed")
+    require(report.get("embedding_kind") == "sentence_transformers", "production release requires Sentence Transformer embeddings")
     for split in ("validation", "test"):
         result = report.get(split, {})
         require(finite(result.get("nll")), split+": invalid likelihood")
@@ -99,7 +111,8 @@ def promote(candidate, serving, evidence_file, policy_file):
     serving.mkdir(parents=True, exist_ok=True)
     release_id = model.version + "-" + hashlib.sha256(canonical(decision).encode()).hexdigest()[:12]
     stage = Path(tempfile.mkdtemp(prefix=".staging-", dir=serving))
-    for name in ("model.ubj", "features.json", "report.json", "manifest.json"):
+    manifest = json.loads((candidate / "manifest.json").read_text())
+    for name in (*manifest["sha256"], "manifest.json"):
         shutil.copyfile(candidate / name, stage / name)
     (stage / "promotion.json").write_text(canonical(decision), encoding="utf-8")
     shutil.copyfile(policy_file, stage / "gate-policy.json")
@@ -112,4 +125,5 @@ def promote(candidate, serving, evidence_file, policy_file):
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp, serving / "CURRENT")
+    _fsync_directory(serving)
     return decision

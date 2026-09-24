@@ -62,4 +62,24 @@ uv run timepredict train --data samples.jsonl --output holdout-candidates \
 
 ## 当前状态
 
+## 新增公开数据集适配
+
+已增加三个独立的代理数据入口，标签不会伪装成生产回返时间：
+
+| 数据集 | 标签 | 适用范围 |
+|---|---|---|
+| `trace-commons/agent-traces` | `proxy_agent_tool_return`，按 `tool_use`/`tool_result` 时间戳配对 | 更接近 Agent 可见等待，但仍没有 SGLang `t_out` 证据 |
+| `ProCreations/betterwright-agent-traces` | `proxy_browser_step_duration`，使用 `browser_steps.ms` | 有真实浏览器步骤遥测，适合验证特征和 GBDT 流程 |
+| `pagarsky/agent-trace` | `proxy_tool_duration`，工具 span 持续时间 | 工具执行时长代理 |
+
+固定 revision、原始文件 SHA-256 和转换版本会写入数据清单。可用下面的命令运行受控实验：
+
+```bash
+TIMEPREDICT_TEST_ENCODER=1 uv run timepredict experiment \
+  --output /external/diagnostics/public-proxy --cache-dir /external/cache \
+  --max-rows 3000 --rounds 500
+```
+
+公开代理实验只写入外部诊断目录，不进入当前 `outputs/replay-model`，也不能作为正式 SGLang 模型发布依据。
+
 本次完成了数据入口和训练链路复核，清理前在 WSL 运行 70 项测试并通过真实 Redis 链路验证。未保留合成训练包，也未下载没有匹配耗时标签的公开语料。后续应首先确定真实工具清单、执行器、目标部署和代表性任务来源，再采集训练集。

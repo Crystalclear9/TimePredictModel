@@ -13,4 +13,7 @@ models/
 holdout-candidates/
 server-acceptance.json
 scale-acceptance.json
+outputs/
+outputs/.wsl-evidence.json
+experiment-cache/
 failover.json

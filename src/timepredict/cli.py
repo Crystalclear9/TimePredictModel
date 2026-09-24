@@ -33,7 +33,33 @@ def main():
     training.add_argument("--threads", type=int, default=4)
     training.add_argument("--rounds", type=int, default=500)
     training.add_argument("--holdout-tool", action="append", default=[])
-    training.add_argument("--data-kind", choices=["observed", "synthetic", "unspecified"], default="unspecified")
+    training.add_argument("--data-kind", choices=["observed", "proxy", "synthetic", "unspecified"], default="unspecified")
+    experiment = sub.add_parser("experiment", help="run pinned public proxy-label experiments")
+    experiment.add_argument("--output", required=True)
+    experiment.add_argument("--cache-dir")
+    experiment.add_argument("--threads", type=int, default=4)
+    experiment.add_argument("--rounds", type=int, default=500)
+    experiment.add_argument("--max-rows", type=int, default=512)
+    replay = sub.add_parser("replay-generate", help="generate measured controlled-tool replay data")
+    replay.add_argument("--output", required=True)
+    replay.add_argument("--rows", type=int, default=5000)
+    replay.add_argument("--seed", type=int, default=42)
+    replay.add_argument("--concurrency", type=int, default=4)
+    regression = sub.add_parser("train-regression", help="train direct quantile regressors on replay labels")
+    regression.add_argument("--data", required=True)
+    regression.add_argument("--output", required=True)
+    regression.add_argument("--threads", type=int, default=4)
+    regression.add_argument("--rounds", type=int, default=500)
+    regression.add_argument("--data-kind", choices=["synthetic_replay", "proxy_tracecommons"], default="synthetic_replay")
+    evaluation = sub.add_parser("evaluate", help="independently reload and evaluate quantile package")
+    evaluation.add_argument("--model", required=True)
+    evaluation.add_argument("--data", required=True)
+    cache_manifest = sub.add_parser("cache-manifest", help="write a revision/hash manifest for local dataset Parquet files")
+    cache_manifest.add_argument("--cache-dir", required=True)
+    cache_manifest.add_argument("--dataset", choices=["exgentic", "agenttrace", "tracecommons", "betterwright"], required=True)
+    audit = sub.add_parser("audit", help="write implementation status audit")
+    audit.add_argument("--output", required=True)
+    audit.add_argument("--evidence")
     check = sub.add_parser("check-data", help="validate labels, workflow grouping and temporal split before training")
     check.add_argument("--data", required=True)
     release = sub.add_parser("promote")
@@ -94,6 +120,33 @@ def main():
         print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
         if not result["trainable"]:
             raise SystemExit(1)
+    elif args.command == "experiment":
+        from .experiment import run
+        if args.threads <= 0 or args.rounds <= 0:
+            parser.error("threads and rounds must be positive")
+        print(json.dumps(run(args.output, args.cache_dir, args.threads, args.rounds, args.max_rows), ensure_ascii=False, allow_nan=False))
+    elif args.command == "replay-generate":
+        from .replay import generate
+        print(json.dumps(generate(args.output, args.rows, args.seed, args.concurrency), ensure_ascii=False, indent=2))
+    elif args.command == "train-regression":
+        from .regression import train_regression
+        from .training import load_rows
+        if args.threads <= 0 or args.rounds <= 0:
+            parser.error("threads and rounds must be positive")
+        label_kind = "observed_replay" if args.data_kind == "synthetic_replay" else "proxy_agent_tool_return"
+        report = train_regression(load_rows(args.data), args.output, args.threads, args.rounds,
+                                  allowed_label_kind=label_kind, data_kind=args.data_kind)
+        print(json.dumps({k: report[k] for k in ('acceptance', 'metrics', 'split_counts')}, indent=2))
+    elif args.command == "evaluate":
+        from .regression import evaluate_model
+        from .training import load_rows
+        print(json.dumps(evaluate_model(args.model, load_rows(args.data)), indent=2))
+    elif args.command == "cache-manifest":
+        from .datasets import write_local_manifest
+        print(json.dumps(write_local_manifest(args.cache_dir, args.dataset), ensure_ascii=False, indent=2))
+    elif args.command == "audit":
+        from .audit import run
+        print(json.dumps(run(args.output, args.evidence), ensure_ascii=False, indent=2))
     elif args.command == "promote":
         from .release import promote
         print(json.dumps(promote(args.candidate, args.serving_dir, args.evidence, args.policy), ensure_ascii=False))

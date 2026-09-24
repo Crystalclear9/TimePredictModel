@@ -51,6 +51,37 @@ def validate_rows(rows):
     return normalized
 
 
+def validate_label_provenance(rows, *, data_kind, production=False):
+    """Enforce the source evidence contract before any fitting.
+
+    A caller cannot turn arbitrary JSON into a production observation by
+    passing ``data_kind=observed``.  Formal SGLang rows carry both boundaries,
+    a verified tool id, and an event/source manifest.  Replay and proxy rows
+    remain explicitly separate experiments.
+    """
+    if data_kind == "observed":
+        required = "sglang_return_observed"
+        for i, row in enumerate(rows, 1):
+            if row.get("label_kind") != required:
+                raise ValueError(f"sample {i}: observed_requires_sglang_return_observed")
+            if row.get("association_mode") != "tool_call_id" or row.get("tool_call_id_verified") is not True:
+                raise ValueError(f"sample {i}: formal_label_requires_verified_tool_call_id")
+            if not isinstance(row.get("t_out"), (int, float)) or not isinstance(row.get("t_return"), (int, float)):
+                raise ValueError(f"sample {i}: formal_label_missing_boundaries")
+            if row.get("source_manifest") is None or row.get("event_evidence") is None:
+                raise ValueError(f"sample {i}: formal_label_missing_event_evidence")
+        if production and any(row.get("association_mode") != "tool_call_id" for row in rows):
+            raise ValueError("serial_fallback_not_allowed_for_production")
+    elif data_kind in ("proxy", "synthetic", "synthetic_replay", "proxy_dataset"):
+        if production:
+            raise ValueError("proxy_or_synthetic_data_not_production_releasable")
+    elif data_kind in ("unspecified", None):
+        if production:
+            raise ValueError("data_kind_required_for_production")
+    else:
+        raise ValueError("invalid_data_kind")
+
+
 def describe(rows):
     return {"rows": len(rows), "workflows": len({r["workflow"] for r in rows}),
             "observed": sum(math.isfinite(r["upper"]) for r in rows),

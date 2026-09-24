@@ -49,7 +49,9 @@ def reduce_event(original, event, *, copy_state=True):
         if source:
             source["bad"], source["lost"] = True, True
         for record in list(state["records"].values()):
-            if record["status"] == "waiting":
+            out_stamp = record.get("out", {})
+            if (record["status"] == "waiting" and
+                    out_stamp.get("source", "") + "/" + out_stamp.get("boot", "") == event.get("lost_source")):
                 invalidate(record, "observation_lost")
         return state, notices
     source_key = stamp["source"] + "/" + stamp["boot"]
@@ -59,8 +61,7 @@ def reduce_event(original, event, *, copy_state=True):
         if gap:
             source["bad"] = True
             for record in list(state["records"].values()):
-                if record["status"] == "waiting":
-                    # A missing ingress event could have closed any active record.
+                if record["status"] == "waiting" and record.get("out", {}).get("source", "") + "/" + record.get("out", {}).get("boot", "") == source_key:
                     invalidate(record, "observation_gap")
         source["seq"] = max(source["seq"], event["seq"])
         source["last"] = stamp
@@ -71,7 +72,7 @@ def reduce_event(original, event, *, copy_state=True):
             if old_key.startswith(stamp["source"] + "/") and old_key != source_key and not old.get("retired"):
                 old["retired"] = True
                 for record in list(state["records"].values()):
-                    if record["status"] == "waiting" and record["out"]["source"] == stamp["source"]:
+                    if record["status"] == "waiting" and record["out"].get("source", "") + "/" + record["out"].get("boot", "") == old_key:
                         invalidate(record, "source_restart")
     if event["kind"] in ("source_heartbeat", "gap"):
         return state, notices
@@ -100,7 +101,18 @@ def reduce_event(original, event, *, copy_state=True):
     def close(record, incoming):
         if record["status"] not in ("waiting", "concurrent_conflict") or record.get("return") or incoming["request_id"] == record["request_id"]:
             return False
-        if record["call"].get("id") not in incoming.get("latest_tool_ids", []):
+        # Under the serial protocol the tenant/workflow/agent key identifies
+        # the only outstanding round. If the continuation includes tool IDs,
+        # require the recorded ID to be present; older clients may omit the
+        # list, in which case the serial invariant is the association proof.
+        supplied = bool(incoming.get("tool_call_ids_present", bool(incoming.get("latest_tool_ids"))))
+        incoming_ids = incoming.get("latest_tool_ids") or []
+        if record.get("association_mismatch") and not supplied:
+            return False
+        if supplied and record["call"].get("id") not in incoming_ids:
+            record["association_mismatch"] = {"request_id": incoming["request_id"], "tool_ids": incoming_ids,
+                                               "at": incoming["stamp"]}
+            record["status_reason"] = "historical_tool_result" if incoming.get("historical_tool_ids") else "association_mismatch"
             return False
         cancelled = state["cancelled_agents"].get(key)
         admitted = state["ingress_seen"].get(json.dumps([key, record["request_id"]]), -float("inf"))
@@ -116,6 +128,9 @@ def reduce_event(original, event, *, copy_state=True):
             return False
         record["return"] = incoming["stamp"]
         record["return_request_id"] = incoming["request_id"]
+        record["association_mode"] = "tool_call_id" if supplied else "serial_fallback"
+        record["association_confidence"] = "verified" if supplied else "degraded"
+        record["tool_call_id_verified"] = supplied
         record["closed_at"] = incoming["stamp"]["utc"]
         try:
             duration = elapsed(record["out"], incoming["stamp"])
@@ -123,6 +138,8 @@ def reduce_event(original, event, *, copy_state=True):
                 raise ValueError("nonpositive_interval")
             record["duration"] = duration
             record["status"] = "returned"
+            record["lifecycle_state"] = "returned"
+            record.setdefault("lifecycle", []).append("returned")
         except ValueError as exc:
             record["status"], record["valid"] = str(exc), False
         incoming_source = incoming["stamp"]["source"] + "/" + incoming["stamp"]["boot"]
@@ -193,17 +210,32 @@ def reduce_event(original, event, *, copy_state=True):
                 reconcile_intervals()
                 return state, notices
         # Buffer unmatched returns, including returns arriving before their OUT event.
-        if event.get("latest_tool_ids"):
-            state["orphans"].setdefault(key, []).append(event)
+        state["orphans"].setdefault(key, []).append(event)
+        return state, notices
+    if kind == "prepared":
+        # Prepared is an observable lifecycle event before the response is sent.
+        gen = hashlib.sha256((key + "/" + event["request_id"]).encode()).hexdigest()
+        if gen not in state["records"] and gen not in state["tombstones"]:
+            state["records"][gen] = {"key": key, "generation": gen, "tenant": event["tenant"], "workflow_id": event["workflow_id"],
+                "agent_id": event["agent_id"], "request_id": event["request_id"], "call": event["call"], "out": stamp,
+                "status": "prepared", "valid": False, "prediction": None, "prediction_status": "not_ready",
+                "workflow_start": state["workflows"][wf]["start"], "lifecycle": ["prepared"], "lifecycle_state": "prepared"}
         return state, notices
     if kind == "out":
         gen = hashlib.sha256((key + "/" + event["request_id"]).encode()).hexdigest()
-        if gen in state["records"] or gen in state["tombstones"]:
+        if gen in state["records"]:
+            existing = state["records"][gen]
+            if existing.get("status") == "prepared":
+                existing["out"] = stamp; existing["call"] = event["call"]; existing["valid"] = True
+                existing["status"] = "waiting"; existing["lifecycle_state"] = "waiting"; existing["lifecycle"].append("waiting")
+                state["pending"][key] = gen; notice(existing, "update"); return state, notices
             return state, notices
+        if gen in state["tombstones"]: return state, notices
         record = {"key": key, "generation": gen, "tenant": event["tenant"], "workflow_id": event["workflow_id"],
                   "agent_id": event["agent_id"], "request_id": event["request_id"], "call": event["call"],
                   "out": stamp, "status": "waiting", "valid": True, "prediction": None,
-                  "prediction_status": "pending_prediction", "workflow_start": state["workflows"][wf]["start"]}
+                  "prediction_status": "pending_prediction", "workflow_start": state["workflows"][wf]["start"],
+                  "lifecycle": ["waiting"], "lifecycle_state": "waiting"}
         state["records"][gen] = record
         if state["sources"].get(source_key, {}).get("bad"):
             invalidate(record, "observation_gap")

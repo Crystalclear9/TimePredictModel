@@ -42,10 +42,15 @@ def window_rows(state, stamp, horizon, tenant=None):
             row["age_seconds"] = age
             prediction = record["prediction"]
             if prediction and record["prediction_status"] == "ready":
-                row.update(LogNormal(prediction["mu"], prediction["sigma"]).summarize(age, horizon))
                 row["model_version"] = prediction["model_version"]
-                row["in_window"] = row["remaining_p50_seconds"] <= horizon and not prediction.get("shadow", False)
-                row["shadow"] = prediction.get("shadow", False)
+                row["p50_seconds"] = prediction.get("p50_seconds")
+                row["p90_seconds"] = prediction.get("p90_seconds")
+                if not prediction.get("distribution_calibrated", False):
+                    row.update(status="unknown", reason="distribution_not_calibrated", in_window=False)
+                else:
+                    row.update(LogNormal(prediction["mu"], prediction["sigma"]).summarize(age, horizon))
+                    row["in_window"] = row["remaining_p50_seconds"] <= horizon and not prediction.get("shadow", False)
+                    row["shadow"] = prediction.get("shadow", False)
             elif row["status"] != "pending_prediction":
                 row["reason"], row["status"] = row["status"], "unknown"
         except (ValueError, UnreliableDistribution) as exc:
