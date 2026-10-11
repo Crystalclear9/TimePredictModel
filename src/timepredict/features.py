@@ -1,3 +1,4 @@
+# 文件作用：结构特征与语义向量契约：训练建立词典，在线按相同顺序转换为 float32 向量。
 import json
 import math
 from collections import Counter
@@ -11,14 +12,17 @@ MAX_BYTES = 256 * 1024
 MAX_DEPTH = 32
 
 
+# 表示参数超限、非 JSON 对象或数值不可表达，调用不能进入预测。
 class UnsupportedInput(ValueError):
     pass
 
 
+# 生成稳定且严格的 JSON 表示；排序键并拒绝 NaN/Infinity。
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+# 把对象/JSON 字符串规范化为字典，检查 256KiB 大小及 32 层深度上限。
 def parse_arguments(arguments):
     try:
         if isinstance(arguments, str):
@@ -29,6 +33,7 @@ def parse_arguments(arguments):
             raise UnsupportedInput("arguments_not_object")
         if len(canonical(arguments).encode("utf-8")) > MAX_BYTES:
             raise UnsupportedInput("arguments_too_large")
+        # 递归检查对象和数组的嵌套深度。
         def check(v, depth):
             if depth > MAX_DEPTH:
                 raise UnsupportedInput("arguments_too_deep")
@@ -44,15 +49,18 @@ def parse_arguments(arguments):
         raise UnsupportedInput(str(exc)) from exc
 
 
+# 提取数值、布尔、字符串长度、数组长度、枚举指示和通用结构统计。
 def extract(call):
     args = parse_arguments(call["arguments"])
     tool = call.get("action_family", call["name"])
     fields, stats = {}, Counter()
     stats["json_bytes"] = len(canonical(args).encode("utf-8"))
 
+    # 用动作族、JSON Pointer 和特征类型组成字段键。
     def put(path, kind, value):
         fields[canonical([tool, path, kind])] = value
 
+    # 遍历参数树；布尔值先于数值判断，嵌套对象按排序后的字段处理。
     def walk(value, path, schema, depth):
         stats["max_depth"] = max(stats["max_depth"], depth)
         if value is None:
@@ -78,6 +86,7 @@ def extract(call):
             kind = "array"
             put(path, "length", len(value))
             # Count structure inside arrays without generating position-specific fields.
+            # 数组内部只累计类型、字段及深度统计，不建立位置相关特征列。
             def count_array(v, d):
                 stats["max_depth"] = max(stats["max_depth"], d)
                 typ = "null" if v is None else "boolean" if isinstance(v, bool) else "object" if isinstance(v, dict) else "array" if isinstance(v, list) else "string" if isinstance(v, str) else "number"
@@ -113,6 +122,7 @@ def extract(call):
 STATS = ("json_bytes", "max_depth", "fields", "null", "boolean", "number", "string", "array", "object")
 
 
+# 保存工具/动作族词典、结构字段和固定语义编码器契约。
 @dataclass
 class FeatureSpec:
     tools: list[str]
@@ -124,6 +134,7 @@ class FeatureSpec:
     embedding_revision: str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
     embedding_kind: str = "sentence_transformers"
 
+    # 仅从传入的训练调用统计字段频率，最多保留 4096 列。
     @classmethod
     def fit(cls, calls, max_fields=4096):
         counts, tools = Counter(), set()
@@ -138,6 +149,7 @@ class FeatureSpec:
         object.__setattr__(spec, "_encoder", encoder)
         return spec
 
+    # 按工具指示、未知工具列、语义向量、统计、结构字段顺序编码；缺失字段用 NaN。
     def transform(self, call):
         if self.version != VERSION:
             raise ValueError("feature_version_mismatch")
@@ -159,5 +171,6 @@ class FeatureSpec:
         values += [fields.get(k, float("nan")) for k in self.fields]
         return np.asarray(values, dtype=np.float32)
 
+    # 导出 dataclass 配置，不包含运行时缓存的编码器。
     def to_dict(self):
         return asdict(self)

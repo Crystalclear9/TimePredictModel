@@ -1,3 +1,4 @@
+# 文件作用：timepredict 命令行入口：解析子命令并按需导入采集、训练、评估、发布模块。
 import argparse
 import asyncio
 import json
@@ -7,6 +8,7 @@ import os
 from pathlib import Path
 
 
+# 注册各子命令与参数，校验基本边界，再分派到对应实现。
 def main():
     parser = argparse.ArgumentParser(description="Server-oriented SGLang return-time predictor")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -87,6 +89,7 @@ def main():
         uvicorn.run(app, host=args.host, port=args.port)
     elif args.command == "export":
         from redis.asyncio import Redis
+        # 分批导出 Redis history 流；使用排他游标避免重复读取上一批末尾。
         async def export_events():
             redis = Redis.from_url(args.redis_url, decode_responses=True)
             cursor = "-"

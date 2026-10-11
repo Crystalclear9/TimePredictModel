@@ -1,3 +1,4 @@
+# 本地环境、缓存和构建产物。
 .venv/
 __pycache__/
 .pytest_cache/
@@ -6,6 +7,7 @@ artifacts/
 vendor/
 dist/
 .env
+# 原始采集数据、候选模型、正式模型与运行证据不提交到版本库。
 events.jsonl
 samples.jsonl
 candidates/

@@ -1,3 +1,4 @@
+# 文件作用：生成绑定源码摘要的环境验证证据；未运行的 Redis/GPU/跨主机验收明确标记未验证。
 """Single evidence-bound WSL verification entry point."""
 import hashlib, json, os, platform, shutil, subprocess, sys, time
 from pathlib import Path
@@ -5,12 +6,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+# 按排序后的源码路径与原始文件字节计算摘要；新增注释也会改变摘要。
 def source_digest():
     h = hashlib.sha256()
     for p in sorted((ROOT / "src").rglob("*.py")):
         h.update(p.relative_to(ROOT).as_posix().encode()); h.update(p.read_bytes())
     return h.hexdigest()
 
+# 捕获单项检查异常并输出 passed/failed 证据。
 def run_check(fn):
     try:
         value = fn() or {}
@@ -18,15 +21,18 @@ def run_check(fn):
     except Exception as exc:
         return {"status":"failed", "reason":f"{type(exc).__name__}: {exc}"}
 
+# 使用当前 Python 编译源码与测试，检查语法错误。
 def _compile():
     p = subprocess.run([sys.executable,"-m","compileall","-q",str(ROOT/"src"),str(ROOT/"tests")], cwd=ROOT)
     if p.returncode: raise RuntimeError("compileall failed")
 
+# 关闭系统 pytest 插件自动加载，记录测试返回码与末尾输出。
 def _pytest():
     env = dict(os.environ, PYTHONPATH=str(ROOT/"src"), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     p = subprocess.run([sys.executable,"-m","pytest","-q"], cwd=ROOT, env=env, text=True, capture_output=True)
     return {"status":"passed" if p.returncode == 0 else "not_verified", "returncode":p.returncode, "output_tail":(p.stdout+p.stderr)[-1200:]}
 
+# 验证最小 prepared→out 事件能够转换为 waiting。
 def _lifecycle():
     from timepredict.state import empty_state, reduce_event
     stamp={"utc":1.,"mono":1.,"source":"verify","boot":"1","error":.001,"jumped":False}
@@ -36,6 +42,7 @@ def _lifecycle():
     if next(iter(state["records"].values()))["status"] != "waiting": raise AssertionError("prepared->waiting failed")
     return {"state":"prepared->waiting"}
 
+# 仅检查补丁包含预期钩子标记；不证明补丁已在上游应用或运行。
 def _patch_static():
     text=(ROOT/"patches/sglang-v0.5.19.patch").read_text(encoding="utf-8")
     required=("tokenizer_worker_num","accepted","observe_stream","observe_nonstream")
@@ -43,6 +50,7 @@ def _patch_static():
     if missing: raise RuntimeError("missing patch markers: "+",".join(missing))
     return {"files":[x[6:] for x in text.splitlines() if x.startswith("+++ b/")]}
 
+# 汇总本环境检查、未验证服务器项目与源码摘要，并写入证据 JSON。
 def main():
     checks={"compileall":run_check(_compile),"pytest":_pytest(),"lifecycle":run_check(_lifecycle),"sglang_patch_static":run_check(_patch_static)}
     try:

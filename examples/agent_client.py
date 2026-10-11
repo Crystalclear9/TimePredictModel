@@ -1,3 +1,4 @@
+# 文件作用：串行单工具 Agent 示例：向 patched SGLang 发请求，执行演示工具并续接，维护观察心跳。
 """OpenAI wire-compatible single-tool Agent; run against a patched server."""
 import argparse
 import asyncio
@@ -9,15 +10,18 @@ import uuid
 import httpx
 
 
+# 创建业务身份，最多执行五轮，支持流式/非流式；完成或异常时发送生命周期事件。
 async def main(args):
     workflow, agent = uuid.uuid4().hex, "agent-1"
     key = os.environ["SGLANG_API_KEY"]
     lifecycle_key = os.environ.get("TIMEPREDICT_API_KEY", key)
     async with httpx.AsyncClient(timeout=120) as client:
+        # 用内部令牌上报当前工作流/Agent 的 heartbeat、cancel 或 terminate。
         async def lifecycle(action):
             response = await client.post(args.predictor + "/internal/lifecycle/" + action,
                 headers={"Authorization": "Bearer " + lifecycle_key}, json={"workflow_id": workflow, "agent_id": agent})
             response.raise_for_status()
+        # 每五秒上报存活，覆盖工具等待阶段。
         async def heartbeat():
             while True:
                 await lifecycle("heartbeat")

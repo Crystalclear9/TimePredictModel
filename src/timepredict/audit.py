@@ -1,7 +1,9 @@
+# 文件作用：依据已有验证证据生成实现审计；此模块本身不会执行服务器验收。
 """Evidence-bound implementation audit."""
 import hashlib,json,platform,time
 from pathlib import Path
 
+# 读取证据、区分本地/WSL/服务器验证状态，并写出禁止生产发布的审计报告。
 def run(output,evidence=None):
     evidence_path=Path(evidence) if evidence else Path(output).with_name("final-audit.json")
     ev=json.loads(evidence_path.read_text()) if evidence_path.exists() else {}

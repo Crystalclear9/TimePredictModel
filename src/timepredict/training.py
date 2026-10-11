@@ -1,3 +1,4 @@
+# 文件作用：AFT 训练和生存评估：事件快照、时间划分、删失标签、IPCW、基线与候选发布。
 import json
 import math
 from collections import Counter, defaultdict
@@ -16,6 +17,7 @@ from .state import empty_state, reduce_event, workflow_key
 from .actions import ActionFamilies
 
 
+# 生成无需绘图库的简单 SVG 曲线，随候选保存。
 def _curve_svg(series, title):
     """Small dependency-free SVG plot retained with the best candidate."""
     width, height, left, top, right, bottom = 900, 500, 70, 55, 25, 55
@@ -25,6 +27,7 @@ def _curve_svg(series, title):
     low, high = min(values), max(values)
     if high <= low:
         high = low + 1.0
+    # 把数值序列按全图范围映射为 SVG 路径坐标。
     def path(values):
         coords = []
         for i, value in enumerate(values):
@@ -45,6 +48,7 @@ def _curve_svg(series, title):
     return "\n".join(lines)
 
 
+# 只回放截取前发生且已观测事件；完整返回产生精确标签，完整观察等待产生右删失。
 def snapshot(events, cutoff, heartbeat_ttl=30):
     if not math.isfinite(cutoff) or heartbeat_ttl <= 0:
         raise ValueError("cutoff must be finite and heartbeat TTL positive")
@@ -88,11 +92,13 @@ def snapshot(events, cutoff, heartbeat_ttl=30):
         except UnsupportedInput:
             excluded["unsupported_input"] += 1
             continue
+        # 当前快照仅输出基础样本字段；正式 observed 训练要求的来源/工具 ID/边界证据未在此补齐。
         rows.append({"generation": record["generation"], "workflow": wf, "workflow_start": state["workflows"][wf]["start"],
                      "workflow_end": state["workflows"][wf]["end"], "call": record["call"], "lower": lower, "upper": upper})
     return rows, dict(excluded)
 
 
+# 按工作流开始时间约 70/15/15 划分，跨分界/未结束的早期工作流整体隔离。
 def split_rows(rows):
     starts = sorted({r["workflow_start"] for r in rows})
     if len(starts) < 7:
@@ -111,6 +117,7 @@ def split_rows(rows):
     return groups
 
 
+# 构造结构/语义特征 DMatrix，并设置 AFT 标签上下界。
 def matrix(rows, spec, time_scale=1.0):
     data = xgb.DMatrix(np.stack([spec.transform(row["call"]) for row in rows]))
     data.set_float_info("label_lower_bound", np.array([r["lower"] * time_scale for r in rows]))
@@ -118,6 +125,7 @@ def matrix(rows, spec, time_scale=1.0):
     return data
 
 
+# 计算对数正态精确标签密度损失或右删失生存损失。
 def nll(rows, mu, sigma):
     t = np.array([r["lower"] for r in rows])
     observed = np.array([math.isfinite(r["upper"]) for r in rows])
@@ -126,6 +134,7 @@ def nll(rows, mu, sigma):
     return float(np.mean(losses))
 
 
+# 建立 Kaplan-Meier 阶梯曲线；censor=True 时估计删失分布。
 def km_curve(rows, censor=False):
     if not rows:
         raise ValueError("empty survival cohort")
@@ -135,12 +144,14 @@ def km_curve(rows, censor=False):
     risks = len(rows) - np.r_[0, np.cumsum(counts[:-1])]
     deaths = np.bincount(inverse, weights=events, minlength=len(times))
     values = np.cumprod(1.0 - deaths / risks)
+    # 按查询时间返回阶梯曲线，可选择取事件发生前的值。
     def at(t, before=False):
         idx = np.searchsorted(times, t, side="left" if before else "right") - 1
         return float(1.0 if idx < 0 else values[idx])
     return at
 
 
+# 用逆删失概率加权评价 Brier 和校准；G<0.05 时拒绝不受支持的尾部。
 def ipcw_score(rows, probabilities, thresholds, censor_curve=None):
     g = censor_curve or km_curve(rows, censor=True)
     total, weight, actual, predicted = 0., 0., 0., 0.
@@ -172,6 +183,7 @@ def ipcw_score(rows, probabilities, thresholds, censor_curve=None):
             "censoring_assumption": "independent administrative censoring; G >= 0.05"}
 
 
+# 报告似然、窗口概率、分位数覆盖和条件剩余窗口的删失校正评估。
 def evaluate(rows, mu, sigma, horizons=(1., 2., 5., 10.)):
     g = km_curve(rows, censor=True)
     result = {"nll": nll(rows, mu, sigma), "rows": len(rows), "censored": sum(not math.isfinite(r["upper"]) for r in rows)}
@@ -193,6 +205,7 @@ def evaluate(rows, mu, sigma, horizons=(1., 2., 5., 10.)):
     return result
 
 
+# 精确标签计算相对误差命中率；出现删失时返回不可用指标。
 def point_accuracy(rows, prediction, tolerances=(0.1, 0.2, 0.5)):
     if any(not math.isfinite(r["upper"]) for r in rows):
         return {str(t): None for t in tolerances}
@@ -202,6 +215,7 @@ def point_accuracy(rows, prediction, tolerances=(0.1, 0.2, 0.5)):
     return {str(t): float(np.mean(relative <= t)) for t in tolerances}
 
 
+# 逐个树前缀重建 P50/P90 诊断曲线，标注验证选定的轮次。
 def accuracy_curve(rows, booster, spec, best_iteration, sigma=0.5, time_scale=1.0):
     if any(not math.isfinite(row["upper"]) for row in rows):
         return {"status": "unsupported_censored_labels", "tolerances": [0.1, 0.2, 0.5]}
@@ -218,6 +232,7 @@ def accuracy_curve(rows, booster, spec, best_iteration, sigma=0.5, time_scale=1.
             "curves": curves, "best_round_accuracy": {t: values[best_iteration] for t, values in curves.items()}}
 
 
+# 按动作族拟合经验 log 时间中位数与尺度；当前训练调用未将其作为主模型。
 def family_priors(rows):
     grouped = defaultdict(list)
     for row in rows:
@@ -226,7 +241,9 @@ def family_priors(rows):
             for name, values in grouped.items()}
 
 
+# 用训练集拟合全局对数正态及全局/按工具 KM 基线，在测试集评价。
 def baseline_reports(train, test):
+    # 数值优化带删失样本的全局对数正态负对数似然。
     def fit(rows):
         logs = np.log([r["lower"] for r in rows])
         fit_result = minimize(lambda p: nll(rows, p[0], math.exp(p[1])), [float(np.mean(logs)), math.log(max(float(np.std(logs)), 0.2))], bounds=[(-30, 30), (-4, 3)])
@@ -243,6 +260,7 @@ def baseline_reports(train, test):
             "per_tool_empirical_windows": {str(h): ipcw_score(test, [1-empirical.get(r["call"]["name"], global_km)(h) for r in test], [h]*len(test), g) for h in (1., 2., 5., 10.)}}
 
 
+# 校验来源，拟合训练动作族/词典，尝试多个 sigma 并按验证 best_score 选择 AFT 候选。
 def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), holdout_tools=(), data_kind="unspecified"):
     rows = validate_rows(rows)
     if threads <= 0 or rounds <= 0 or not sigmas or any(not math.isfinite(s) or s <= 0 for s in sigmas):
@@ -289,9 +307,12 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
         booster = xgb.train(params, train_data, num_boost_round=rounds, evals=[(train_data, "train"), (validation, "validation")],
                             evals_result=evals_result, early_stopping_rounds=30, verbose_eval=False)
         candidates.append((float(booster.best_score), sigma, booster, evals_result))
+    # 现有实现按不同 sigma 的 XGBoost best_score 直接比较；此处记录行为，不代表比较规则已完成审计。
     _, sigma, booster, evals_result = min(candidates, key=lambda v: v[0])
+    # 取选定树前缀的 AFT margin，并减去 log(time_scale) 恢复秒单位。
     def predict(data):
         return booster.predict(matrix(data, spec), output_margin=True, iteration_range=(0, booster.best_iteration+1)) - math.log(time_scale)
+    # 将候选预测送入带删失支持的统一评估。
     def assess(data):
         return evaluate(data, predict(data), sigma)
     tree_validation = assess(groups["validation"])
@@ -348,6 +369,7 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
                    prediction_mode="xgboost_aft", family_priors={}, curve_svg=curve, artifacts=artifacts), report
 
 
+# 逐行严格读取 JSONL，拒绝 NaN/Infinity 和非对象，并给出出错行号。
 def load_rows(path):
     rows = []
     with Path(path).open(encoding="utf-8-sig") as handle:
@@ -364,6 +386,7 @@ def load_rows(path):
     return rows
 
 
+# 按当前规范化行顺序计算 SHA-256；无限删失上界编码为 null。
 def dataset_digest(rows):
     from hashlib import sha256
     from .features import canonical
@@ -373,6 +396,7 @@ def dataset_digest(rows):
     return digest.hexdigest()
 
 
+# 校验并统计时间划分，指出训练/验证是否包含精确返回标签。
 def inspect_dataset(rows):
     rows = validate_rows(rows)
     groups = split_rows(rows)

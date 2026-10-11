@@ -1,2 +1,4 @@
+# 统一文本换行，方便 Linux 部署和跨平台 diff。
 * text=auto eol=lf
+# 补丁保留上游上下文的空白，不应用普通空白检查规则。
 *.patch -whitespace

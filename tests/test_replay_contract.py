@@ -1,3 +1,4 @@
+# 文件作用：受控回放契约测试：边界有序、标签来源明确，时间与结果不进入参数特征。
 import json
 from pathlib import Path
 
@@ -5,6 +6,7 @@ from timepredict.features import extract
 from timepredict.replay import generate
 
 
+# 生成 100 条真实本地回放样本并检查第一条的边界和特征排除约定。
 def test_replay_boundaries_and_feature_exclusion(tmp_path):
     manifest = generate(tmp_path, rows=100, seed=11, concurrency=8)
     assert manifest["label_kind"] == "observed_replay"

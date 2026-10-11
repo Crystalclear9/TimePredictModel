@@ -1,3 +1,4 @@
+# 文件作用：分别运行公开代理数据实验；不同标签定义的报告保持独立。
 """Run independent public proxy experiments without cross-label ranking."""
 import json
 from pathlib import Path
@@ -6,6 +7,7 @@ from .datasets import DATASETS, load_proxy_rows, load_semantic_rows
 from .training import train
 
 
+# 对三个代理数据源分别训练 AFT 候选并保存摘要，Exgentic 仅统计语义描述符。
 def run(output, cache_dir=None, threads=4, rounds=500, max_rows=512):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)

@@ -1,3 +1,4 @@
+# 文件作用：Redis 存储：单 JSON 状态文档通过 WATCH/MULTI/EXEC 原子更新，并同步写通知及历史。
 import json
 import time
 
@@ -6,7 +7,9 @@ from redis.exceptions import WatchError
 from .state import apply_prediction, empty_state, reduce_event
 
 
+# 用 prefix 隔离状态、事件、历史、通知键以及 leader 租约约束。
 class RedisStore:
+    # 建立键名、租约前置条件和 CAS 指标。
     def __init__(self, redis, prefix="timepredict"):
         self.redis, self.prefix = redis, prefix
         self.state_key = prefix + ":state"
@@ -16,10 +19,12 @@ class RedisStore:
         self.required_lease = None
         self.metrics = {"transactions": 0, "cas_retries": 0, "state_bytes": 0, "last_transaction_seconds": 0.}
 
+    # 读取共享状态；尚未初始化时返回空状态。
     async def read(self):
         raw = await self.redis.get(self.state_key)
         return json.loads(raw) if raw else empty_state()
 
+    # 监视状态及可选 leader token；冲突重试，将状态/通知/首次事件历史在同一事务提交。
     async def mutate(self, reducer, event=None):
         started = time.monotonic()
         while True:
@@ -50,10 +55,13 @@ class RedisStore:
                     self.metrics["cas_retries"] += 1
                     continue
 
+    # 以事件状态机作为 reducer，原子应用一个事件。
     async def apply(self, event):
         return await self.mutate(lambda state: reduce_event(state, event, copy_state=False), event)
 
+    # 把预测写回包装为共享状态事务。
     async def prediction(self, generation, prediction, status, available_at=None):
+        # 返回新状态和 apply_prediction 产生的通知。
         def update(state):
             return state, apply_prediction(state, generation, prediction, status, available_at)
         return await self.mutate(update)

@@ -1,3 +1,4 @@
+# 文件作用：统一模型加载/预测入口与 AFT 候选打包；直接回归包转交 RegressionModel。
 import hashlib
 import json
 import math
@@ -14,6 +15,7 @@ from .features import STATS, FeatureSpec, UnsupportedInput, canonical
 from .actions import ActionFamilies
 
 
+# 尝试持久化目录元数据；不支持的文件系统按现有逻辑忽略 OSError。
 def _fsync_directory(path):
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -24,6 +26,7 @@ def _fsync_directory(path):
     except OSError:
         pass
 
+# 刷新候选文件；兼容 Windows 对只读句柄 fsync 的限制。
 def _fsync_file(path):
     try:
         with open(path, "rb") as handle:
@@ -34,17 +37,21 @@ def _fsync_file(path):
         pass
 
 
+# 记录 Python、XGBoost、NumPy 和 SciPy 版本。
 def versions():
     return {"python": platform.python_version(), "xgboost": xgb.__version__, "numpy": np.__version__, "scipy": scipy.__version__}
 
 
+# 加载 CURRENT 指向的包或直接目录，并根据 manifest 选择预测路径。
 class Model:
+    # 检查包摘要、特征维度和依赖契约；AFT 正式加载还检查 promotion 证据。
     def __init__(self, directory, *, require_promoted=False):
         root = Path(directory)
         pointer = root / "CURRENT"
         if pointer.exists():
             root = root / pointer.read_text().strip()
         manifest = json.loads((root / "manifest.json").read_text())
+        # 当前直接回归分支提前返回，未执行下方 require_promoted 的发布证据检查。
         if manifest.get("model_type") == "xgboost_direct_log_time":
             from .regression import RegressionModel
             self._regression = RegressionModel(root)
@@ -91,6 +98,7 @@ class Model:
         if self.booster.num_features() != expected:
             raise ValueError("feature_dimension_mismatch")
 
+    # 直接回归返回未校准的 P50/P90；AFT 返回 mu/sigma，输入不支持时返回状态原因。
     def predict(self, call):
         if hasattr(self, "_regression"):
             try:
@@ -123,6 +131,7 @@ class Model:
         return {"mu": mu, "sigma": self.sigma, "model_version": self.version}, "ready"
 
 
+# 在 staging 写入并刷新 AFT 模型、特征、清单与报告，再原子重命名为不可变候选版本。
 def publish(root, booster, spec, sigma, best_iteration, report, action_families=None, prediction_mode=None, family_priors=None, curve_svg=None, artifacts=None):
     """Write an immutable candidate. Training never updates a serving pointer."""
     root = Path(root)

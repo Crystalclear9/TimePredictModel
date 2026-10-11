@@ -1,3 +1,4 @@
+# 文件作用：精确标签的直接 log(T) 回归：P50 使用平方误差，P90 使用独立分位数目标；不提供完整生存分布。
 """Direct log-time XGBoost regression for observed replay labels.
 
 This is deliberately separate from the AFT service: quantile regressors do
@@ -23,24 +24,28 @@ from .training import split_rows
 from .semantic import SemanticEncoder
 
 
+# 转换冻结特征，并以 log(lower) 作为精确回归标签。
 def _dmatrix(rows, spec):
     x = np.stack([spec.transform(r["call"]) for r in rows])
     y = np.log(np.asarray([r["lower"] for r in rows], dtype=np.float32))
     return xgb.DMatrix(x, label=y)
 
 
+# 把对数预测还原为秒，统计相对误差不超过 10%/20%/50% 的命中率。
 def _accuracy(rows, pred):
     target = np.asarray([r["lower"] for r in rows], dtype=float)
     rel = np.abs(np.exp(pred) - target) / target
     return {str(t): float(np.mean(rel <= t)) for t in (0.1, 0.2, 0.5)}
 
 
+# 计算给定分位数在 log(T) 空间的非对称 pinball loss。
 def _pinball(rows, pred, q):
     y = np.log(np.asarray([r["lower"] for r in rows], dtype=float))
     e = y - pred
     return float(np.mean(np.maximum(q * e, (q - 1) * e)))
 
 
+# 校验精确标签与真实编码器，按工作流划分，训练/校准两个模型并原子保存诊断包。
 def train_regression(rows, output, threads=4, rounds=500,
                      allowed_label_kind="observed_replay", data_kind="synthetic_replay"):
     if os.environ.get("TIMEPREDICT_TEST_ENCODER") == "1":
@@ -104,6 +109,7 @@ def train_regression(rows, output, threads=4, rounds=500,
             calibration_offsets[str(q)] = float(np.quantile(residuals, q, method="higher"))
         except TypeError:
             calibration_offsets[str(q)] = float(np.quantile(residuals, q, interpolation="higher"))
+    # 使用选定轮次及验证残差偏移预测；P90 按现有实现与原始 P50 比较取最大。
     def predict(group, q):
         data = _dmatrix(group, spec)
         model = boosters[str(q)]
@@ -254,6 +260,7 @@ def train_regression(rows, output, threads=4, rounds=500,
     return report
 
 
+# 仅从本地缓存读取固定 revision 的编码器，记录配置/词表/权重摘要。
 def encoder_contract():
     from huggingface_hub import snapshot_download
     encoder = SemanticEncoder()
@@ -268,7 +275,9 @@ def encoder_contract():
     return {**encoder.to_dict(), 'files_sha256': files}
 
 
+# 独立恢复双模型包并验证文件及编码器契约。
 class RegressionModel:
+    # 校验必需文件、SHA-256、XGBoost 主版本与编码器，再载入两个 booster。
     def __init__(self, directory):
         root = Path(directory).resolve()
         self.manifest = json.loads((root / 'manifest.json').read_text())
@@ -297,6 +306,7 @@ class RegressionModel:
             b.load_model(root / f'p{int(q*100)}-model.ubj')
             self.boosters[q] = b
 
+    # 匹配动作族并转换特征；加校准偏移、指数还原，最终保证返回 P90≥P50。
     def quantiles(self, call):
         call = self.families.enrich(call)
         data = xgb.DMatrix(self.spec.transform(call)[None, :])
@@ -304,6 +314,7 @@ class RegressionModel:
         return np.exp([logs[0], max(logs)])
 
 
+# 独立加载模型并核对标签类型；仅评估精确样本，报告排除的删失数量。
 def evaluate_model(directory, rows):
     model = RegressionModel(directory)
     rows = validate_rows(rows)

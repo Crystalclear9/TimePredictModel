@@ -1,3 +1,4 @@
+# 文件作用：Linux 服务器验收：比较基线与采集部署的完整单工具往返，汇总关联、时钟和性能证据。
 """Full single-tool roundtrip acceptance; run against isolated Linux acceptance servers.
 
 The tool execution is a fixed delay/result; generated code is never executed.
@@ -21,6 +22,7 @@ from timepredict.sglang import Capture
 from timepredict.store import RedisStore
 
 
+# 统一非流式响应与 SSE 拼接；不完整流或异常工具输出不能继续工具轮次。
 async def completion(client, url, body, headers):
     if not body["stream"]:
         response = await client.post(url.rstrip("/")+"/v1/chat/completions", json=body, headers=headers)
@@ -54,6 +56,7 @@ async def completion(client, url, body, headers):
     return result
 
 
+# 校验健康状态、来源新鲜度和跨主机校时误差总和不超过 5ms。
 def clock_ok(health):
     now = health.get("clock", {})
     if health.get("status") != "ok" or not health.get("sources"):
@@ -73,6 +76,7 @@ def clock_ok(health):
     return True
 
 
+# 预热并交替测试两组部署，以 Redis 闭合记录和遥测构建 server_acceptance 证据。
 async def run(args):
     payloads = [json.loads(line) for line in Path(args.requests).read_text().splitlines() if line.strip()]
     if not payloads or any(not p.get("tools") for p in payloads):
@@ -83,11 +87,13 @@ async def run(args):
     store = RedisStore(redis, args.prefix)
     trials, health_samples, probe_errors, tracked = {"baseline": [], "instrumented": []}, [], [], {}
     async with httpx.AsyncClient(timeout=args.timeout, limits=httpx.Limits(max_connections=args.concurrency+4)) as client:
+        # 读取经过认证的预测服务健康响应。
         async def health():
             response = await client.get(args.predictor.rstrip("/")+"/internal/health", headers=internal)
             response.raise_for_status()
             return response.json()
         before = await health()
+        # 每秒采集一次健康状态，探测异常单独累计。
         async def monitor():
             while True:
                 try:
@@ -97,8 +103,10 @@ async def run(args):
                 await asyncio.sleep(1)
         monitor_task = asyncio.create_task(monitor())
 
+        # 按并发限额执行一组完整往返，计算吞吐与 P99，比较区间之外再清理生命周期。
         async def measure(urls, count, observed):
             sem, durations, errors = asyncio.Semaphore(args.concurrency), [], []
+            # 发出单工具请求、等待固定延时，并在下一入口携带匹配工具 ID 续接。
             async def request(i):
                 async with sem:
                     payload = {**payloads[i % len(payloads)], "stream": bool(i % 2), "n": 1, "parallel_tool_calls": False}
@@ -159,6 +167,7 @@ async def run(args):
     records = [r for r in state["records"].values() if r["workflow_id"] in tracked]
     matched = {r["workflow_id"] for r in records if r["status"] == "returned" and r["valid"]
                and r["call"]["id"] == tracked[r["workflow_id"]]["call_id"]}
+    # 确认指定流式模式的所有工作流在客户端及 Redis 状态中都完成回返。
     def mode_pass(stream):
         workflows = {w for w, v in tracked.items() if v["stream"] == stream}
         return bool(workflows) and workflows <= matched and all(tracked[w]["returned"] for w in workflows)

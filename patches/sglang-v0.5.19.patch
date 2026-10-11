@@ -1,9 +1,10 @@
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
-@@ -2606,6 +2606,10 @@
+@@ -2606,6 +2606,11 @@
                  f"keyfile={server_args.ssl_keyfile}"
              )
  
++        # 安装采集层；是否启用由 TIMEPREDICT_REDIS_URL 决定。
 +        from timepredict.sglang import install as install_timepredict
 +
 +        install_timepredict(app, server_args)
@@ -13,11 +14,12 @@
              if server_args.enable_http2:
 --- a/python/sglang/srt/entrypoints/openai/serving_base.py
 +++ b/python/sglang/srt/entrypoints/openai/serving_base.py
-@@ -83,6 +83,11 @@
+@@ -83,6 +83,12 @@
              error_msg = self._validate_request(request)
              if error_msg:
                  return self.create_error_response(error_msg)
 +
++            # 请求校验通过后提交入口关联事件，沿用中间件记录的初始时间。
 +            from timepredict.sglang import accepted
 +
 +            if raw_request is not None:
@@ -27,11 +29,12 @@
              request_logger = self.tokenizer_manager.request_logger
 --- a/python/sglang/srt/entrypoints/openai/serving_chat.py
 +++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
-@@ -1519,7 +1519,11 @@
+@@ -1519,7 +1519,12 @@
          raw_request: Request,
      ) -> Union[StreamingResponse, ErrorResponse]:
          """Handle streaming chat completion request"""
 -        generator = self._generate_chat_stream(adapted_request, request, raw_request)
++        # 观察 SSE 工具片段，再原样转发；终止发送边界由中间件记录。
 +        from timepredict.sglang import observe_stream
 +
 +        generator = observe_stream(
@@ -40,10 +43,11 @@
  
          # Kick-start the generator to trigger validation before HTTP 200 is sent.
          # If validation fails (e.g., context length exceeded), we can still return
-@@ -1829,6 +1833,9 @@
+@@ -1829,6 +1834,10 @@
              int(time.time()),
          )
  
++        # 捕获完整非流式响应中的工具调用，不在这里执行预测。
 +        from timepredict.sglang import observe_nonstream
 +
 +        observe_nonstream(response, raw_request)

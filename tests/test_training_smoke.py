@@ -1,3 +1,4 @@
+# 文件作用：小规模 AFT 打包冒烟测试：几轮训练后检查产物、恢复模型并完成预测。
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +7,9 @@ from timepredict.training import train
 from timepredict.model import Model
 
 
+# 组织候选训练与独立加载的基础断言。
 class TrainingSmoke(unittest.TestCase):
+    # 以十个合成工作流训练三轮，检查包文件和恢复后的模型版本。
     def test_model_package_contract(self):
         rows = []
         for index in range(10):

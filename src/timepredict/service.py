@@ -1,3 +1,4 @@
+# 文件作用：FastAPI 内部服务与单 leader worker：消费事件、调度 CPU 预测、刷新候选并提供租户隔离接口。
 import asyncio
 import contextlib
 import json
@@ -22,6 +23,7 @@ from .metrics import Histograms
 logger = logging.getLogger(__name__)
 
 
+# 过滤租户与过期观察；仅已校准分布计算条件剩余时间，其他预测保留分位数并降级 unknown。
 def window_rows(state, stamp, horizon, tenant=None):
     rows = []
     for gen in state["pending"].values():
@@ -45,6 +47,7 @@ def window_rows(state, stamp, horizon, tenant=None):
                 row["model_version"] = prediction["model_version"]
                 row["p50_seconds"] = prediction.get("p50_seconds")
                 row["p90_seconds"] = prediction.get("p90_seconds")
+                # 缺少显式校准标记也视为未校准；当前 AFT predict 同样未设置此标记。
                 if not prediction.get("distribution_calibrated", False):
                     row.update(status="unknown", reason="distribution_not_calibrated", in_window=False)
                 else:
@@ -59,7 +62,9 @@ def window_rows(state, stamp, horizon, tenant=None):
     return {"snapshot_utc": stamp["utc"], "revision": state["revision"], "H_seconds": horizon, "records": rows}
 
 
+# 在 Redis 租约保护下处理事件和状态；API 副本可独立读取共享状态。
 class Worker:
+    # 初始化周期、预测并发上限四、运行指标和任务集合。
     def __init__(self, store, model_dir=None, clock=None, horizon=2., refresh=0.1, heartbeat_ttl=30, shadow=False):
         self.store, self.model_dir, self.clock = store, model_dir, clock or Clock()
         self.horizon, self.refresh, self.heartbeat_ttl = horizon, refresh, heartbeat_ttl
@@ -67,17 +72,20 @@ class Worker:
         self.shadow = shadow
         self.inflight = set()
         self.prediction_tasks = set()
+        # CPU 预测最多四个并发；tick 另将已排队 generation 限制为 64 个。
         self.semaphore = asyncio.Semaphore(4)
         self.metrics = {"events": 0, "prediction_errors": 0, "predictions": 0, "redis_errors": 0}
         self.last_error = None
         self.histograms = Histograms()
         self.clock_task = None
 
+    # 每秒调用时钟刷新；Clock 内部进一步限制 chronyc 查询频率。
     async def maintain_clock(self):
         while True:
             await asyncio.to_thread(self.clock.refresh)
             await asyncio.sleep(1)
 
+    # 持续运行 worker，异常后记录原因并两秒后重启；取消信号正常向上传递。
     async def supervise(self):
         while True:
             try:
@@ -89,6 +97,7 @@ class Worker:
                 logger.exception("worker restarting after failure")
                 await asyncio.sleep(2)
 
+    # 在线程执行一次 CPU 预测并条件写回；等待期间已返回/取消的轮次不再更新。
     async def predict_one(self, record):
         generation = record["generation"]
         started = time.monotonic()
@@ -133,6 +142,7 @@ class Worker:
         finally:
             self.inflight.discard(generation)
 
+    # 消费 Redis 组消息并接管超时未确认消息；状态/历史成功提交后才 XACK。
     async def consume(self):
         redis = self.store.redis
         try:
@@ -166,6 +176,7 @@ class Worker:
                 logger.exception("event consumer failure")
                 await asyncio.sleep(1)
 
+    # 周期加载模型、失效过期观察、调度未预测轮次，并发布版本化候选快照。
     async def tick(self):
         last_load = 0.
         last_compact = 0.
@@ -199,6 +210,7 @@ class Worker:
                         self.prediction_tasks.add(task)
                         task.add_done_callback(self.prediction_tasks.discard)
                 # Every refresh is a versioned snapshot; transitions and snapshots share one CAS domain.
+                # 在同一 CAS 事务中更新处理器心跳和候选 revision/通知。
                 def refresh(state):
                     state["processor"] = now
                     view = window_rows(state, now, self.horizon)
@@ -218,6 +230,7 @@ class Worker:
                 logger.exception("refresh failed")
             await asyncio.sleep(self.refresh)
 
+    # 同时维护时钟与选主工作，结束时取消时钟任务。
     async def run(self):
         clock_task = asyncio.create_task(self.maintain_clock())
         try:
@@ -226,6 +239,7 @@ class Worker:
             clock_task.cancel()
             await asyncio.gather(clock_task, return_exceptions=True)
 
+    # 获取十五秒 leader 租约；同时运行消费、刷新和续租，退出时取消任务并按 token 释放租约。
     async def run_elected(self):
         # A single elected worker preserves per-source ordering; API replicas remain stateless.
         lease = self.store.prefix + ":worker-lease"
@@ -234,6 +248,7 @@ class Worker:
             await asyncio.sleep(2)
         self.store.required_lease = (lease, token)
         self.last_error = None
+        # 每三秒按 token 续租；token 不匹配表示 leader 身份失效。
         async def renew():
             while True:
                 await asyncio.sleep(3)
@@ -252,18 +267,22 @@ class Worker:
                 await self.store.redis.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end", 1, lease, token)
 
 
+# 约束生命周期请求体：工作流和 Agent ID 长度为 1..256。
 class Lifecycle(BaseModel):
     workflow_id: str = Field(min_length=1, max_length=256)
     agent_id: str = Field(default="*", min_length=1, max_length=256)
 
 
+# 创建认证 API 和生命周期任务；tokens 必须至少包含一个内部令牌到 tenant 的映射。
 def create_app(store, tokens, clock=None, worker=None):
     if not tokens:
         raise ValueError("at least one authentication token is required")
     clock = clock or Clock()
 
+    # 随应用启动后台任务，随应用退出取消并等待任务结束。
     @asynccontextmanager
     async def lifespan(app):
+        # 未配置 worker 时仍维护 API 的本地时钟状态。
         async def api_clock():
             while True:
                 await asyncio.to_thread(clock.refresh)
@@ -279,6 +298,7 @@ def create_app(store, tokens, clock=None, worker=None):
 
     app = FastAPI(title="Tool return prediction", lifespan=lifespan)
 
+    # 常量时间比较 Bearer 令牌并返回绑定的租户命名空间。
     async def tenant(authorization: str = Header(default="")):
         token = authorization.removeprefix("Bearer ")
         for expected, namespace in tokens.items():
@@ -286,6 +306,7 @@ def create_app(store, tokens, clock=None, worker=None):
                 return namespace
         raise HTTPException(401, "invalid credential")
 
+    # 先读取通知游标，再读取快照，减少并发更新时消费端漏通知的风险。
     @app.get("/internal/window")
     async def window(H_seconds: float = Query(gt=0, allow_inf_nan=False), namespace=Depends(tenant)):
         try:
@@ -298,6 +319,7 @@ def create_app(store, tokens, clock=None, worker=None):
         result["notice_cursor"] = last_notice[0][0] if last_notice else "0-0"
         return result
 
+    # 验证 heartbeat/cancel/terminate 并写入事件流；accepted 只表示已入流。
     @app.post("/internal/lifecycle/{action}")
     async def lifecycle(action: str, body: Lifecycle, namespace=Depends(tenant)):
         if action not in ("heartbeat", "cancel", "terminate"):
@@ -311,6 +333,7 @@ def create_app(store, tokens, clock=None, worker=None):
             raise HTTPException(503, "event transport unavailable") from exc
         return {"accepted": True, "event_id": event["event_id"]}
 
+    # 读取游标后的通知并过滤租户；历史候选租约过期时降级而不重新激活。
     @app.get("/internal/notices")
     async def notices(after: str = "0-0", limit: int = Query(default=100, ge=1, le=1000), namespace=Depends(tenant)):
         if not __import__("re").fullmatch(r"\d+-\d+", after):
@@ -334,6 +357,7 @@ def create_app(store, tokens, clock=None, worker=None):
         return {"cursor": messages[-1][0] if messages else after,
                 "events": events}
 
+    # 报告 Redis、处理器新鲜度、模型、时钟和指标；degraded 响应体仍使用 HTTP 200。
     @app.get("/internal/health")
     async def health(namespace=Depends(tenant)):
         try:

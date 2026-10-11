@@ -1,3 +1,4 @@
+# 文件作用：固定 revision 的公开数据转换器；输出代理标签或无标签描述符，不能证明正式 SGLang 回返边界。
 """Small Hugging Face adapters for controlled proxy-label experiments.
 
 The public traces do not expose the SGLang response-send and agent-return
@@ -23,6 +24,7 @@ DATASETS = {
 CONVERTER_VERSION = "2026-09-22.1"
 
 
+# 为本地 Parquet 文件记录配置的 revision、转换器版本及逐文件 SHA-256。
 def write_local_manifest(cache_dir, name):
     """Create the required manifest for an explicitly downloaded Parquet cache."""
     if name not in DATASETS:
@@ -31,12 +33,14 @@ def write_local_manifest(cache_dir, name):
     files = sorted(root.glob("*.parquet"))
     if not files:
         raise ValueError(f"no parquet files in {root}")
+    # 此 revision 是配置声明；文件 hash 证明缓存一致性，不能单独证明下载来源。
     manifest = {"dataset": name, "revision": DATASETS[name][1], "converter_version": CONVERTER_VERSION,
                 "files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}}
     (root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 
 
+# 兼容已解析对象和 JSON 字符串；解析失败返回指定默认值。
 def _json(value, default):
     if isinstance(value, str):
         try:
@@ -46,6 +50,7 @@ def _json(value, default):
     return value if value is not None else default
 
 
+# 将有限数值或 ISO 时间转换为 Unix 秒；大数值按纳秒处理。
 def _unix(value):
     if isinstance(value, (int, float)) and math.isfinite(value):
         return float(value) / (1e9 if value > 1e12 else 1.0)
@@ -57,6 +62,7 @@ def _unix(value):
         return None
 
 
+# 保留并规范化工具参数；兼容 Python 字典包装文本，解析失败明确拒绝。
 def _call(name, arguments, schema=None):
     if not isinstance(name, str) or not name:
         name = "unknown_tool"
@@ -85,6 +91,7 @@ def _call(name, arguments, schema=None):
     return {"name": name, "arguments": arguments, "schema": schema if isinstance(schema, dict) else {}, "description": ""}
 
 
+# Exgentic 无可靠回返边界，因此不产生耗时训练样本。
 def _exgentic(row, prefix):
     # Exgentic does not prove the SGLang send-to-Agent-return interval. It is
     # intentionally excluded from time training; use _exgentic_calls for
@@ -92,6 +99,7 @@ def _exgentic(row, prefix):
     return []
 
 
+# 只提取工具名称、参数、schema 和描述，用于无标签语义覆盖分析。
 def _exgentic_calls(row, prefix):
     """Extract tool call descriptors without inventing a duration label."""
     spans = _json(row.get("spans"), [])
@@ -122,6 +130,7 @@ def _exgentic_calls(row, prefix):
     return calls_out
 
 
+# 提取 TOOL span；校验起止边界与 duration_ms 一致，再转换为秒级代理标签。
 def _agenttrace(row, prefix):
     spans = _json(row.get("spans_json"), [])
     if not isinstance(spans, list):
@@ -161,6 +170,7 @@ def _agenttrace(row, prefix):
     return out
 
 
+# 按工具 ID 配对 tool_use/tool_result，并以会话为工作流输出代理回返时长。
 def _tracecommons(row, prefix):
     """Pair timestamped tool_use/tool_result events by their stable id.
 
@@ -243,6 +253,7 @@ def _tracecommons(row, prefix):
     return out
 
 
+# 优先使用浏览器步骤 ms；无可用步骤时退回模型轮次 latency_ms，两者标签明确区分。
 def _betterwright(row, prefix):
     """Extract per-turn latency telemetry from Betterwright.
 
@@ -318,6 +329,7 @@ def _betterwright(row, prefix):
     return out
 
 
+# 读取通过清单校验的本地 Parquet 或固定 revision 的流式数据，再调用专用转换器。
 def load_proxy_rows(name, cache_dir=None, max_rows=None):
     """Stream a pinned dataset and return normalized proxy rows."""
     if name not in DATASETS:
@@ -381,6 +393,7 @@ def load_proxy_rows(name, cache_dir=None, max_rows=None):
     return rows
 
 
+# 仅对 Exgentic 加载无耗时标签的描述符；其他数据源返回空列表。
 def load_semantic_rows(name, cache_dir=None, max_rows=None):
     """Load descriptors for coverage analysis without time labels."""
     if name != "exgentic":

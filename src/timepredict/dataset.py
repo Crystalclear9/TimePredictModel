@@ -1,3 +1,4 @@
+# 文件作用：训练样本契约：先校验标签、工作流元数据、参数和来源证据，再允许拟合特征。
 """Validate the training contract before fitting any feature dictionary or model."""
 import math
 from collections import Counter
@@ -5,10 +6,12 @@ from collections import Counter
 from .features import extract
 
 
+# 判断有限数值，并排除 Python 中也属于 int 的布尔值。
 def finite_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+# 复制并规范化样本；只接受精确标签 [T,T] 或右删失 [a,null]，拒绝重复 generation。
 def validate_rows(rows):
     if not rows:
         raise ValueError("dataset is empty")
@@ -51,6 +54,7 @@ def validate_rows(rows):
     return normalized
 
 
+# 正式 observed 标签必须携带工具 ID、边界与事件证据；代理/合成数据不能用于生产。
 def validate_label_provenance(rows, *, data_kind, production=False):
     """Enforce the source evidence contract before any fitting.
 
@@ -82,6 +86,7 @@ def validate_label_provenance(rows, *, data_kind, production=False):
         raise ValueError("invalid_data_kind")
 
 
+# 统计样本、工作流、精确/删失标签及工具分布。
 def describe(rows):
     return {"rows": len(rows), "workflows": len({r["workflow"] for r in rows}),
             "observed": sum(math.isfinite(r["upper"]) for r in rows),

@@ -1,3 +1,4 @@
+# 文件作用：本地 HTTP 受控回放：真实测量网络/工具/固定延时的时间，样本始终标记为合成回放。
 """Measured HTTP round trips to synthetic, controlled tools (never production labels)."""
 import argparse
 import concurrent.futures
@@ -15,11 +16,13 @@ from pathlib import Path
 VERSION = "replay-1"
 NAMES = ("sleep_tool", "http_tool", "file_tool", "database_tool")
 
+# 使用高分辨率单调计时器，秒为单位。
 def _tick():
     """High resolution monotonic seconds; Windows monotonic() is too coarse."""
     return time.perf_counter_ns() / 1_000_000_000.0
 
 
+# 构造四类工具与参数，启动本地端点并并发执行，保存样本、时间划分及数据清单。
 def generate(output, rows=5000, seed=42, concurrency=4):
     if rows < 100 or concurrency < 1:
         raise ValueError("need >=100 rows and positive concurrency")
@@ -46,10 +49,13 @@ def generate(output, rows=5000, seed=42, concurrency=4):
         workflow = f"replay-{seed}-wf-{i // calls_per_workflow:04d}"
         jobs.append((i, workflow, name, args, rng.uniform(-0.0015, 0.0015)))
 
+    # 模拟工具调用完整响应的 HTTP 端点；并非真实 SGLang。
     class Handler(BaseHTTPRequestHandler):
+        # 关闭回放服务器的默认访问日志。
         def log_message(self, *args):
             pass
 
+        # 接收模拟调用，在响应写出前记录 t_out，并通过 JSON 交给本地执行器。
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             # The endpoint represents SGLang's completed response.  It emits
@@ -66,6 +72,7 @@ def generate(output, rows=5000, seed=42, concurrency=4):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
+    # 执行文件/SQLite 或模拟工作量，加参数控制延时；本地 tool_end 同时作为 t_return。
     def execute(job):
         i, workflow, name, args, jitter = job
         utc, start = time.time(), _tick()

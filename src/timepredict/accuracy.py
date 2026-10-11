@@ -1,3 +1,4 @@
+# 文件作用：旧 AFT 模型的逐轮准确率诊断；要求使用原训练数据，不适用于直接回归包。
 """Reconstruct iteration accuracy for a saved model on its original cohort."""
 import argparse
 import json
@@ -10,6 +11,7 @@ from .model import Model
 from .training import dataset_digest, matrix, split_rows
 
 
+# 校验数据摘要，重建时间划分，绘制训练/验证曲线和选定轮次的测试点。
 def render(rows, model_dir, output):
     import matplotlib
     matplotlib.use("Agg")

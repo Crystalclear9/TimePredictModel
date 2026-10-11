@@ -1,3 +1,4 @@
+# 文件作用：固定 SGLang 版本的采集适配层：观察请求与工具响应，不在 GPU 推理进程中预测模型。
 """Optional SGLang v0.5.19 hooks. No model inference happens here."""
 import asyncio
 import hashlib
@@ -15,7 +16,9 @@ from .publisher import Publisher
 logger = logging.getLogger(__name__)
 
 
+# 为同步采集钩子增加异常隔离和开销记录，采集失败标记 gap。
 def safe_hook(function):
+    # 只在启用 observer 的请求上采集；失败不阻止正常推理。
     @wraps(function)
     def wrapped(value, raw_request):
         observer = raw_request.scope.get("state", {}).get("timepredict_observer")
@@ -36,6 +39,7 @@ def safe_hook(function):
     return wrapped
 
 
+# 只从最近 assistant 工具轮次对应的连续 tool 消息收集匹配 ID。
 def latest_tool_ids(messages):
     ids = []
     for message in reversed(messages):
@@ -51,7 +55,9 @@ def latest_tool_ids(messages):
     return []
 
 
+# 累计一轮响应中的工具调用片段，并记录多选项、多工具和不完整输入原因。
 class Capture:
+    # 按所在类初始化调用累计器或 ASGI 中间件及发布器所有权。
     def __init__(self, identity, tools, supported=True):
         self.identity, self.tools = identity, tools
         self.calls = {}
@@ -59,6 +65,7 @@ class Capture:
         self.saw_tool = False
         self.completed = False
 
+    # 处理完整响应或 SSE delta；按工具 index 拼接 ID、名称与参数。
     def observe(self, data, stream):
         if "error" in data:
             self.reason = "stream_error"
@@ -83,6 +90,7 @@ class Capture:
             if choice.get("finish_reason") in ("length", "error", "abort"):
                 self.reason = "incomplete_response"
 
+    # 生成单工具采集载荷，附上工具定义；入口只检查参数对象完整性。
     def payload(self):
         if not self.saw_tool:
             return None
@@ -100,6 +108,7 @@ class Capture:
         return {**self.identity, "call": call, "reason": self.reason}
 
 
+# 在上游认证/校验之后采集 ingress，tenant 由已认证 Bearer key 的 SHA-256 派生。
 @safe_hook
 def accepted(request, raw_request):
     """Called by the authenticated route after request validation."""
@@ -128,6 +137,7 @@ def accepted(request, raw_request):
                                 "tool_call_ids_present": bool(latest_ids)}, state["timepredict_received"])
 
 
+# 从非流式模型响应对象读取完整工具调用。
 @safe_hook
 def observe_nonstream(response, raw_request):
     capture = raw_request.scope.get("state", {}).get("timepredict_capture")
@@ -135,6 +145,7 @@ def observe_nonstream(response, raw_request):
         capture.observe(response.model_dump(exclude_none=True), False)
 
 
+# 逐块观察完整 SSE 消息，随后原样转发给响应发送层。
 async def observe_stream(generator, raw_request):
     capture = raw_request.scope.get("state", {}).get("timepredict_capture")
     async for chunk in generator:
@@ -153,13 +164,16 @@ async def observe_stream(generator, raw_request):
         yield chunk
 
 
+# 在 ASGI 请求入口及终止响应发送边界打时间戳，管理发布器生命周期。
 class ObservationMiddleware:
+    # 按所在类初始化调用累计器或 ASGI 中间件及发布器所有权。
     def __init__(self, app, redis_url=None, publisher=None):
         self.app = app
         self.publisher = publisher
         self.redis_url = redis_url or os.environ.get("TIMEPREDICT_REDIS_URL")
         self.owned = publisher is None
 
+    # 处理启动关闭及 chat 请求；包装 send 以记录 prepared/out 和发送失败。
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
             if self.redis_url and self.publisher is None:
@@ -181,6 +195,7 @@ class ObservationMiddleware:
         state["timepredict_received"] = self.publisher.clock.stamp()
         streaming, success = False, False
 
+        # 发送前记录终止边界时间，先发布 prepared，发送成功后发布 out；异常标记 delivery_failed。
         async def wrapped_send(message):
             nonlocal streaming, success
             if message["type"] == "http.response.start":
@@ -223,6 +238,7 @@ class ObservationMiddleware:
                 capture.completed = True
 
 
+# 仅环境变量启用时安装采集；要求每个 SGLang 副本只有一个 HTTP/tokenizer worker。
 def install(app, server_args):
     if os.environ.get("TIMEPREDICT_REDIS_URL"):
         worker_count = getattr(server_args, "tokenizer_worker_num", None)

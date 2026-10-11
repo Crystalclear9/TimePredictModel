@@ -1,3 +1,4 @@
+# 文件作用：确定性事件状态机：业务键标识 Agent，generation 标识轮次，revision 标识可消费状态版本。
 """Deterministic event reducer. Redis owns serialization, never frontend processes."""
 import copy
 import hashlib
@@ -6,20 +7,25 @@ import json
 from .clock import elapsed
 
 
+# 将 tenant/workflow/agent 编码为稳定业务键。
 def key_of(event):
     return json.dumps([event["tenant"], event["workflow_id"], event["agent_id"]], separators=(",", ":"))
 
 
+# 建立记录、待回返索引、幂等表、来源、孤立入口、心跳与工作流状态。
 def empty_state():
     return {"records": {}, "pending": {}, "seen": {}, "sources": {}, "orphans": {}, "revision": 0, "heartbeats": {}, "workflows": {}, "ingress_seen": {}, "cancelled_agents": {}, "tombstones": {}}
 
 
+# 生成租户隔离的 workflow 键。
 def workflow_key(e):
     return json.dumps([e["tenant"], e["workflow_id"]], separators=(",", ":"))
 
 
+# 按 event_id 幂等归约事件，维护来源缺口、生命周期、回返关联和待回返状态。
 def reduce_event(original, event, *, copy_state=True):
     state = copy.deepcopy(original) if copy_state else original
+    # Redis 可能重复投递；幂等归约避免重复闭合与重复通知。
     if event["event_id"] in state["seen"]:
         return state, []
     state["seen"][event["event_id"]] = event["stamp"]["utc"]
@@ -28,11 +34,13 @@ def reduce_event(original, event, *, copy_state=True):
     if event.get("observed_at", event["stamp"]["utc"]) - event["stamp"]["utc"] > 7*86400:
         return state, notices
 
+    # 递增全局及记录 revision，收集更新或移除通知。
     def notice(record, action):
         state["revision"] += 1
         record["revision"] = state["revision"]
         notices.append({"action": action, "key": record["key"], "generation": record["generation"], "revision": state["revision"], "tenant": record["tenant"]})
 
+    # 关闭记录并取消有效性；只有 pending 指向当前 generation 才删除索引。
     def invalidate(record, status):
         record["status"] = status
         record["valid"] = False
@@ -55,6 +63,7 @@ def reduce_event(original, event, *, copy_state=True):
                 invalidate(record, "observation_lost")
         return state, notices
     source_key = stamp["source"] + "/" + stamp["boot"]
+    # 来源序号断层或进程重启意味着观察不完整，相关等待标签必须失效。
     if "seq" in event:
         source = state["sources"].get(source_key, {"seq": 0, "bad": False})
         gap = event["seq"] != source["seq"] + 1 or event["kind"] == "gap"
@@ -98,6 +107,7 @@ def reduce_event(original, event, *, copy_state=True):
                 invalidate(record, {"cancel": "cancelled", "terminate": "terminated", "expire": "observation_lost"}[event["kind"]])
         return state, notices
 
+    # 关联续接请求并计算时间标签；明确 ID 优先，无 ID 时允许串行降级且标记 degraded。
     def close(record, incoming):
         if record["status"] not in ("waiting", "concurrent_conflict") or record.get("return") or incoming["request_id"] == record["request_id"]:
             return False
@@ -150,6 +160,7 @@ def reduce_event(original, event, *, copy_state=True):
         notice(record, "remove")
         return True
 
+    # 重建同 Agent 各轮等待区间；重叠时冲突，延迟入口证明串行时按现有规则恢复。
     def reconcile_intervals():
         # Conflicts stop predictions immediately, but delayed ingress can prove a
         # seemingly overlapping interval was actually serial. Preserve both OUTs.
@@ -212,6 +223,7 @@ def reduce_event(original, event, *, copy_state=True):
         # Buffer unmatched returns, including returns arriving before their OUT event.
         state["orphans"].setdefault(key, []).append(event)
         return state, notices
+    # prepared 只是可观测发送准备状态，尚不能生成有效等待预测。
     if kind == "prepared":
         # Prepared is an observable lifecycle event before the response is sent.
         gen = hashlib.sha256((key + "/" + event["request_id"]).encode()).hexdigest()
@@ -225,6 +237,7 @@ def reduce_event(original, event, *, copy_state=True):
         gen = hashlib.sha256((key + "/" + event["request_id"]).encode()).hexdigest()
         if gen in state["records"]:
             existing = state["records"][gen]
+            # 当前 prepared→out 分支直接激活后返回；不会执行下方新建 out 的完整调和逻辑。
             if existing.get("status") == "prepared":
                 existing["out"] = stamp; existing["call"] = event["call"]; existing["valid"] = True
                 existing["status"] = "waiting"; existing["lifecycle_state"] = "waiting"; existing["lifecycle"].append("waiting")
@@ -270,6 +283,7 @@ def reduce_event(original, event, *, copy_state=True):
     return state, notices
 
 
+# 仅给仍 waiting 且 pending_prediction 的轮次写预测，防止迟到结果复活旧候选。
 def apply_prediction(state, generation, prediction, status, available_at=None):
     record = state["records"].get(generation)
     if not record or record["status"] != "waiting" or record["prediction_status"] != "pending_prediction":
@@ -282,6 +296,7 @@ def apply_prediction(state, generation, prediction, status, available_at=None):
     return [{"action": "update", "tenant": record["tenant"], "key": record["key"], "generation": generation, "revision": state["revision"]}]
 
 
+# 清理一小时以上闭合热记录，用七天 tombstone 保留幂等；训练历史流独立保留。
 def compact(state, now):
     """Bound online history; the immutable Redis history stream remains the training source."""
     state.setdefault("tombstones", {})

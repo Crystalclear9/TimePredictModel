@@ -1,3 +1,4 @@
+# 文件作用：AFT 生产发布门禁：训练报告、服务器证据及显式策略都通过才切换 CURRENT。
 """Explicit quality gate and atomic promotion; no bypass flag."""
 import hashlib
 import json
@@ -12,10 +13,12 @@ from .features import canonical
 from .model import Model
 
 
+# 计算文件 SHA-256，用于绑定发布包和证据。
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+# 尝试刷新发布目录的元数据。
 def _fsync_directory(path):
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -27,11 +30,14 @@ def _fsync_directory(path):
         pass
 
 
+# 累计来源、校准、样本支持、基线、证据时效和服务器性能检查失败原因。
 def evaluate_gate(report, evidence, policy, version):
     failures = []
+    # 保留所有未满足项，不在第一项失败时终止评估。
     def require(test, label):
         if not test:
             failures.append(label)
+    # 检查有限数值，并排除布尔值。
     def finite(value):
         return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
     positive = ("min_supported_rows", "min_effective_samples", "evidence_max_age_seconds",
@@ -47,6 +53,7 @@ def evaluate_gate(report, evidence, policy, version):
             failures.append("invalid gate policy: "+field)
     if failures:
         return {"decision": "rejected", "failures": failures, "model_version": version}
+    # 检查 IPCW 支持/有效样本量及预测概率与实际概率的校准误差。
     def metric(value, label, tolerance, target=None):
         require(isinstance(value, dict), label+": missing")
         if not isinstance(value, dict):
@@ -97,6 +104,7 @@ def evaluate_gate(report, evidence, policy, version):
     return {"decision": "rejected" if failures else "approved", "failures": failures, "model_version": version}
 
 
+# 门禁通过后复制候选及证据，验证正式包，再原子替换 CURRENT 文本指针。
 def promote(candidate, serving, evidence_file, policy_file):
     candidate, serving = Path(candidate).resolve(), Path(serving).resolve()
     model = Model(candidate)

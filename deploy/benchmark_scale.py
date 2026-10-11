@@ -1,3 +1,4 @@
+# 文件作用：Linux 容量验收：独立 Redis prefix 下测量单状态文档 CAS、窗口计算和离线评估资源。
 """Measure the supported state envelope on target hardware, using a private Redis prefix.
 
 This creates synthetic state; it is capacity evidence only for the supplied sizes/workload.
@@ -21,6 +22,7 @@ from timepredict.service import window_rows
 import numpy as np
 
 
+# 为各规模构造合成等待状态，测 CAS/内存/窗口耗时后清理专用键，再评估离线资源。
 async def run(args):
     redis = Redis.from_url(args.redis_url, decode_responses=True)
     reports = []
@@ -29,6 +31,7 @@ async def run(args):
             store = RedisStore(redis, "timepredict-scale-"+uuid.uuid4().hex)
             state = empty_state()
             now = time.time()
+            # 生成规模测试专用事件和固定时钟；不构成真实生产标签。
             def event(i, kind="out"):
                 return {"event_id": uuid.uuid4().hex, "kind": kind, "tenant": "scale", "workflow_id": str(i),
                         "agent_id": "scale", "request_id": str(i), "stamp": {"utc": now, "mono": 1., "source": "scale", "boot": "fixture", "error": .001},
@@ -39,10 +42,12 @@ async def run(args):
             state["processor"] = stamp
             for record in state["records"].values():
                 record["prediction_status"] = "ready"
+                # 该夹具未带 distribution_calibrated；按当前 window_rows 会降级 unknown，使 ready_rows 验收失败。
                 record["prediction"] = {"mu": math.log(3), "sigma": .5, "model_version": "synthetic-scale"}
             await redis.set(store.state_key, json.dumps(state))
             latencies = []
             sem = asyncio.Semaphore(args.concurrency)
+            # 在并发信号量下提交一次 heartbeat 事务并记录总耗时。
             async def mutation(i):
                 async with sem:
                     start = time.perf_counter()

@@ -1,3 +1,4 @@
+# systemd 模板：路径、专用账户和 service.env 应与实际服务器部署一致。
 [Unit]
 Description=SGLang tool return predictor
 After=network-online.target
@@ -8,8 +9,10 @@ Type=simple
 User=timepredict
 WorkingDirectory=/opt/timepredict
 EnvironmentFile=/etc/timepredict/service.env
+# 默认仅本机监听；读取正式 models/CURRENT 与内部令牌文件。
 ExecStart=/opt/timepredict/.venv/bin/timepredict serve --host 127.0.0.1 --port 8098 --window-h 2 --models /var/lib/timepredict/models --tokens-file /etc/timepredict/tokens.json
 Restart=on-failure
+# 进程故障后三秒重启；leader 切换另由 Redis 租约控制。
 RestartSec=3
 NoNewPrivileges=true
 

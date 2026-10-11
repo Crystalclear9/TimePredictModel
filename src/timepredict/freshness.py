@@ -1,3 +1,4 @@
+# 文件作用：读接口独立检查观察新鲜度；即使 worker 未发送移除通知，也不能继续使用过期候选。
 """Read-side liveness checks independent of the elected worker."""
 import math
 from .clock import elapsed
@@ -6,10 +7,12 @@ PROCESSOR_TTL = 2.0
 OBSERVER_TTL = 30.0
 
 
+# 用可信时间差从租约寿命中扣除已过去时间。
 def remaining_ttl(stamp, now, ttl):
     return ttl - elapsed(stamp, now)
 
 
+# 综合处理器 2 秒、来源/Agent 30 秒租约；返回降级原因及最短剩余有效期。
 def observation_status(state, record, now):
     processor = state.get("processor")
     if not processor:

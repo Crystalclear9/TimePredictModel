@@ -1,3 +1,4 @@
+# 文件作用：独立 Linux 验收部署的 leader 故障演练；执行操作者显式提供的停止命令，并验证新 leader 消费事件。
 """Controlled predictor failover drill on a dedicated acceptance deployment.
 
 --stop-command is a JSON argv array explicitly supplied by the operator. No shell.
@@ -16,10 +17,12 @@ import httpx
 from redis.asyncio import Redis
 
 
+# 记录旧 leader，执行 JSON argv 停止命令，等待新实例接管并在 history 中找到探测心跳。
 async def run(args):
     redis = Redis.from_url(args.redis_url, decode_responses=True)
     headers = {"Authorization": "Bearer "+os.environ["TIMEPREDICT_API_KEY"]}
     async with httpx.AsyncClient(timeout=5) as client:
+        # 通过内部令牌读取指定实例健康与模型版本。
         async def health(url):
             response = await client.get(url.rstrip("/")+"/internal/health", headers=headers)
             response.raise_for_status()
