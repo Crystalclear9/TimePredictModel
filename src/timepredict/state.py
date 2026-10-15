@@ -5,6 +5,7 @@ import hashlib
 import json
 
 from .clock import elapsed
+from .freshness import observation_failure
 
 
 # 将 tenant/workflow/agent 编码为稳定业务键。
@@ -24,6 +25,27 @@ def workflow_key(e):
 
 # 按 event_id 幂等归约事件，维护来源缺口、生命周期、回返关联和待回返状态。
 def reduce_event(original, event, *, copy_state=True):
+    state, notices = _reduce_event(original, event, copy_state=copy_state)
+    if any(s.get("bad") or s.get("lost") or "failure_since" in s for s in state["sources"].values()):
+        for record in state["records"].values():
+            if record["status"] not in ("waiting", "returned", "concurrent_conflict"):
+                continue
+            failure = observation_failure(state, record)
+            if failure == record.get("observation_failure"):
+                continue
+            if failure:
+                record["observation_failure"] = failure
+            else:
+                record.pop("observation_failure", None)
+            state["revision"] += 1
+            record["revision"] = state["revision"]
+            notices.append({"action": "remove" if failure or record["status"] != "waiting" else "update",
+                            "key": record["key"], "generation": record["generation"],
+                            "revision": state["revision"], "tenant": record["tenant"]})
+    return state, notices
+
+
+def _reduce_event(original, event, *, copy_state=True):
     state = copy.deepcopy(original) if copy_state else original
     # Redis 可能重复投递；幂等归约避免重复闭合与重复通知。
     if event["event_id"] in state["seen"]:
@@ -66,6 +88,8 @@ def reduce_event(original, event, *, copy_state=True):
         if not source or source.get("retired") or source["last"]["utc"] != event.get("last_seen", source["last"]["utc"]):
             return state, notices
         if source:
+            source.setdefault("failure_since", source["last"] if not source.get("bad") else None)
+            source.setdefault("failure_reason", "observation_lost")
             source["bad"], source["lost"] = True, True
         for record in list(state["records"].values()):
             out_stamp = record.get("out", {})
@@ -79,6 +103,8 @@ def reduce_event(original, event, *, copy_state=True):
         source = state["sources"].get(source_key, {"seq": 0, "bad": False})
         gap = event["seq"] != source["seq"] + 1 or event["kind"] == "gap"
         if gap:
+            source.setdefault("failure_since", source.get("last") if not source.get("bad") else None)
+            source.setdefault("failure_reason", "observation_gap")
             source["bad"] = True
             for record in list(state["records"].values()):
                 if record["status"] == "waiting" and record.get("out", {}).get("source", "") + "/" + record.get("out", {}).get("boot", "") == source_key:
@@ -89,7 +115,11 @@ def reduce_event(original, event, *, copy_state=True):
             source["telemetry"] = event["telemetry"]
         state["sources"][source_key] = source
         for old_key, old in state["sources"].items():
-            if old_key.startswith(stamp["source"] + "/") and old_key != source_key and not old.get("retired"):
+            if (not source.get("retired") and old_key.startswith(stamp["source"] + "/")
+                    and old_key != source_key and not old.get("retired")):
+                old.setdefault("failure_since", old["last"] if not old.get("bad") else None)
+                old.setdefault("failure_reason", "source_restart")
+                old["failure_until"] = stamp
                 old["retired"] = True
                 for record in list(state["records"].values()):
                     if record["status"] == "waiting" and record["out"].get("source", "") + "/" + record["out"].get("boot", "") == old_key:

@@ -1,10 +1,35 @@
 # 文件作用：读接口独立检查观察新鲜度；即使 worker 未发送移除通知，也不能继续使用过期候选。
 """Read-side liveness checks independent of the elected worker."""
-import math
 from .clock import elapsed
 
 PROCESSOR_TTL = 2.0
 OBSERVER_TTL = 30.0
+
+
+def _proven_before(left, right):
+    difference = elapsed(left, right)
+    same_clock = (left["source"], left["boot"]) == (right["source"], right["boot"])
+    return difference >= (0. if same_clock else left["error"] + right["error"])
+
+
+def observation_failure(state, record):
+    """A missing ingress event can affect a call sent by any other observer."""
+    for source in state["sources"].values():
+        if not (source.get("bad") or source.get("lost") or "failure_since" in source):
+            continue
+        since, until = source.get("failure_since"), source.get("failure_until")
+        try:
+            if since is not None and record.get("return") is not None and _proven_before(record["return"], since):
+                continue  # Proven complete before this observer's uncertain interval.
+        except ValueError:
+            pass
+        try:
+            if until is not None and _proven_before(until, record["out"]):
+                continue  # A new call after a replacement observer became visible.
+        except ValueError:
+            pass
+        return source.get("failure_reason", "observation_lost")
+    return None
 
 
 # 用可信时间差从租约寿命中扣除已过去时间。
@@ -14,6 +39,9 @@ def remaining_ttl(stamp, now, ttl):
 
 # 综合处理器 2 秒、来源/Agent 30 秒租约；返回降级原因及最短剩余有效期。
 def observation_status(state, record, now):
+    failure = observation_failure(state, record)
+    if failure:
+        return failure, 0.
     processor = state.get("processor")
     if not processor:
         return "processor_unavailable", 0.

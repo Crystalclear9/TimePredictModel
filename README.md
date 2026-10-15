@@ -38,6 +38,8 @@
 
 `log(T)=mu+sigma*Z, Z~N(0,1)`。条件窗口概率为 `(F(a+H)-F(a))/(1-F(a))`。剩余P50/P90、均值及 `E[min(R,H)]` 都从条件分布计算，等待期间不重新编码或运行树。生存概率低于1e-12时拒绝极端尾部外推。
 
+截断驻留成本使用截断一阶矩，窄窗口采用单位区间积分，避免“微秒级调用、秒级窗口”时数值积分漏掉概率质量而错误返回零成本。
+
 ## 安装和测试
 
 Python 3.11+：
@@ -61,6 +63,10 @@ uv run python scripts/verify_sglang_patch.py
 3. SGLang 启用 API key，每副本一个 HTTP/tokenizer worker，可多副本。Agent 携带 X-Workflow-ID、X-Agent-ID、X-Request-ID；重试复用 request_id。
 4. Agent 等待期间每5秒 heartbeat，结束上报 terminate，取消上报 cancel。见 `examples/agent_client.py`。
 5. 内部 tokens.json 为 `{"internal-token":"sha256-of-sglang-api-key"}`，必须是非空 JSON 对象，键为非空 ASCII 令牌，值为非空租户字符串；null 租户会在启动时被拒绝。租户命名空间来自已认证 SGLang key 的摘要。令牌文件不要提交仓库。
+
+采集入口使用跨进程重启保持稳定的逻辑 ID，默认由 hostname、HTTP host/port 组成。容器 hostname 会改变时，为每个副本设置独立且稳定的 `TIMEPREDICT_OBSERVER_ID`，同一 ID 不应同时分配给两个存活副本。启动实例以不同 boot 标识区分，旧 boot 的迟到事件不能撤销新 boot。
+
+任意入口的采集缺口或失联都可能遗漏另一入口调用的续接。插件按缺口时间区间阻断相关候选和训练标签；替代入口出现后，只放行能够证明在恢复边界之后发出的新调用。旧调用不会自动恢复，缺口前已完成的调用可由时间证据保留。旧版源记录缺少稳定 ID 或缺口边界时保守返回 unknown；迁移应排空调用后切换采集 prefix 或从完整事件历史重建状态。
 
 ```bash
 uv run timepredict serve --window-h 2 --tokens-file /etc/timepredict/tokens.json --models models
@@ -94,6 +100,8 @@ uv run timepredict promote --candidate candidates/VERSION --serving-dir models -
 
 正式标签、校准/基线/样本支持及对应版本的服务器验收全部通过，才原子更新 CURRENT。加载校验包摘要、特征契约和归档证据，之后才设置 distribution_calibrated=true。等待中的调用保留原预测版本。证据过期后不再对新调用发出可用预测。P99、吞吐和校准门槛是验收目标，不是已测得结果。
 
+候选及正式发布文件均在切换前执行文件同步，POSIX 同时同步目录；同步失败不再被忽略。若 CURRENT 已替换但最终目录同步失败，报告 `PromotionCommitUncertain`，需要核对 CURRENT、模型和存储状态。Windows 不执行目录 fsync，本地通过不证明断电恢复能力。
+
 ## 周期重训和对照实验
 
 ```bash
@@ -103,7 +111,7 @@ uv run timepredict ablation --data samples.jsonl --data-kind observed --output a
 
 retrain 固定历史流边界及UTC截断，在独立进程训练候选；可续租的 Redis 租约避免重叠训练。数据和配置不变且候选包通过完整性加载检查时才复用；候选丢失或损坏时重新训练。`deploy/timepredict-train.service`、`deploy/timepredict-train.timer` 提供每小时模板。
 
-要验收后自动发布，同时提供 --serving-dir、--evidence、--policy；证据需匹配新版本。失败时保留线上模型并写入 training/last-run.json。模板默认仅训练候选。
+要验收后自动发布，同时提供 --serving-dir、--evidence、--policy；证据需匹配新版本。提交前的验收或文件同步失败不切换 CURRENT；提交后的目录同步错误记录为 `publication_outcome_uncertain`，不能假定仍在使用旧模型。训练收据本身写入失败时也需直接核对 CURRENT。模板默认仅训练候选。
 
 ablation 共享数据、划分和训练预算，保存基线与增强的已知/未知工具质量，以及编码+树预测的缓存/非缓存开销。实际投机收益由外部模块实验决定。
 

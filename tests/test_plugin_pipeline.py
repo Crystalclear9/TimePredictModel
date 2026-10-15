@@ -344,6 +344,13 @@ def test_periodic_training_stable_cutoff_and_lease(tmp_path, monkeypatch):
         second = await retrain_once(args)
         assert first["status"] == "candidate_trained" and second["status"] == "unchanged"
         assert first["version"] == second["version"]
+        from timepredict import release
+        def uncertain(*args, **kwargs):
+            raise release.PromotionCommitUncertain("fixture CURRENT commit outcome uncertain")
+        monkeypatch.setattr(release, "promote", uncertain)
+        args.serving_dir, args.evidence, args.policy = tmp_path/"serving", "fixture", "fixture"
+        assert (await retrain_once(args))["status"] == "publication_outcome_uncertain"
+        args.serving_dir = args.evidence = args.policy = None
         await redis.set("periodic:training-lease", "other")
         assert (await retrain_once(args))["reason"] == "trainer_already_running"
         args.prefix = "empty-history"

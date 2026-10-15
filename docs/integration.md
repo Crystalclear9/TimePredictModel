@@ -99,6 +99,8 @@ SDK 对输入行和输出行保留独立副本；接入方修改返回的嵌套�
 
 `pending_prediction` 表示尚未计算；`unknown` 附带 `reason`，例如模型不存在、未校准、参数不支持、时钟不可靠、来源丢失或极端尾部。消费方均不主动加载。影子行可含预测统计，但 `in_window=false`，不能参与实际加载。
 
+`observation_gap`、`observation_lost`、`source_restart` 也可能由其他采集入口的故障引起，因为续接不保证回到原入口。故障影响区间未排除时，有效期为零；入口恢复也不自动使区间内的旧调用变为可执行。接入方应遵守 unknown 和版本化移除，不能仅凭 out 所在入口仍存活而继续加载。
+
 heartbeat/cancel 使用 JSON `{"workflow_id":"w","agent_id":"a"}`；terminate 可以省略 agent_id 结束整个工作流。`accepted=true` 只表示生命周期事件已入流，不是状态已经归约完成。
 
 同一 `(tenant, workflow_id, agent_id)` 下必须遵守串行单工具调用。需要并发 Agent 分支时分配不同的 agent_id；并发多工具轮次不在 v1 预测范围内。

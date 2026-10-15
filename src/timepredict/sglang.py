@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import socket
 import time
 from functools import wraps
 
@@ -171,18 +172,19 @@ async def observe_stream(generator, raw_request):
 # 在 ASGI 请求入口及终止响应发送边界打时间戳，管理发布器生命周期。
 class ObservationMiddleware:
     # 按所在类初始化调用累计器或 ASGI 中间件及发布器所有权。
-    def __init__(self, app, redis_url=None, publisher=None):
+    def __init__(self, app, redis_url=None, publisher=None, source_id=None):
         self.app = app
         self.publisher = publisher
         self.redis_url = redis_url or os.environ.get("TIMEPREDICT_REDIS_URL")
         self.owned = publisher is None
+        self.source_id = source_id
 
     # 处理启动关闭及 chat 请求；包装 send 以记录 prepared/out 和发送失败。
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
             if self.redis_url and self.publisher is None:
                 redis = Redis.from_url(self.redis_url, decode_responses=True, socket_timeout=2)
-                self.publisher = Publisher(redis, Clock(), os.environ.get("TIMEPREDICT_PREFIX", "timepredict") + ":events")
+                self.publisher = Publisher(redis, Clock(source_id=self.source_id), os.environ.get("TIMEPREDICT_PREFIX", "timepredict") + ":events")
                 self.publisher.start()
             try:
                 await self.app(scope, receive, send)
@@ -248,4 +250,10 @@ def install(app, server_args):
         worker_count = getattr(server_args, "tokenizer_worker_num", None)
         if worker_count != 1:
             raise ValueError("timepredict requires one authenticated HTTP worker per replica; deploy multiple replicas for multiple ingress")
-        app.add_middleware(ObservationMiddleware)
+        source_id = os.environ.get("TIMEPREDICT_OBSERVER_ID")
+        if not source_id:
+            port = getattr(server_args, "port", None)
+            if port is None:
+                raise ValueError("timepredict requires TIMEPREDICT_OBSERVER_ID or a stable HTTP port")
+            source_id = f"{socket.gethostname()}:sglang:{getattr(server_args, 'host', '0.0.0.0')}:{port}"
+        app.add_middleware(ObservationMiddleware, source_id=source_id)

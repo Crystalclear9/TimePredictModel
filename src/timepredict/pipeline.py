@@ -70,7 +70,7 @@ def ablation(rows, output, *, data_kind, threads=4, rounds=500, holdout_tools=()
 async def retrain_once(args):
     """Run outside the online worker. A renewed Redis lease prevents overlapping trainers."""
     from redis.asyncio import Redis
-    from .release import promote
+    from .release import promote, PromotionCommitUncertain
     redis = Redis.from_url(args.redis_url, decode_responses=True)
     key, token = args.prefix+":training-lease", uuid.uuid4().hex
     if not await redis.set(key, token, nx=True, ex=120):
@@ -162,6 +162,8 @@ async def retrain_once(args):
                                                                   args.serving_dir, args.evidence, args.policy,
                                                                   before_commit=publication_guard)
                     result["status"] = "promoted"
+                except PromotionCommitUncertain as exc:
+                    result.update(status="publication_outcome_uncertain", publication_error=str(exc))
                 except (ValueError, OSError) as exc:
                     result.update(status="candidate_requires_acceptance", promotion_error=str(exc))
             atomic_json(previous_path, result)

@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from .features import canonical
-from .model import Model
+from .model import Model, _fsync_directory, _fsync_file
 
 
 # 计算文件 SHA-256，用于绑定发布包和证据。
@@ -18,16 +18,8 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-# 尝试刷新发布目录的元数据。
-def _fsync_directory(path):
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
+class PromotionCommitUncertain(OSError):
+    """The pointer was replaced, but its directory durability was not confirmed."""
 
 
 # 累计来源、校准、样本支持、基线、证据时效和服务器性能检查失败原因。
@@ -129,7 +121,12 @@ def promote(candidate, serving, evidence_file, policy_file, *, before_commit=Non
     shutil.copyfile(policy_file, stage / "gate-policy.json")
     shutil.copyfile(evidence_file, stage / "acceptance.json")
     Model(stage, require_promoted=True)
+    for path in stage.iterdir():
+        if path.is_file():
+            _fsync_file(path)
+    _fsync_directory(stage)
     os.replace(stage, serving / release_id)
+    _fsync_directory(serving)
     fd, temp = tempfile.mkstemp(prefix=".current-", dir=serving)
     with os.fdopen(fd, "w") as handle:
         handle.write(release_id+"\n")
@@ -142,5 +139,8 @@ def promote(candidate, serving, evidence_file, policy_file, *, before_commit=Non
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
-    _fsync_directory(serving)
+    try:
+        _fsync_directory(serving)
+    except OSError as exc:
+        raise PromotionCommitUncertain("CURRENT was replaced; publication durability is unconfirmed") from exc
     return decision

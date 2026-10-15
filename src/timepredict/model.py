@@ -16,26 +16,20 @@ from .features import STATS, FeatureSpec, UnsupportedInput, canonical
 from .actions import ActionFamilies
 
 
-# 尝试持久化目录元数据；不支持的文件系统按现有逻辑忽略 OSError。
+# POSIX 发布要求持久化目录元数据；Windows 不提供此目录 fsync 路径。
 def _fsync_directory(path):
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
-# 刷新候选文件；兼容 Windows 对只读句柄 fsync 的限制。
+# 写模式避免 Windows 只读句柄限制；真实同步错误必须传给发布方。
 def _fsync_file(path):
-    try:
-        with open(path, "rb") as handle:
-            os.fsync(handle.fileno())
-    except OSError:
-        # Some Windows filesystems reject fsync on read-only handles; Linux
-        # publication still performs the required durability barrier.
-        pass
+    with open(path, "r+b") as handle:
+        os.fsync(handle.fileno())
 
 
 # 记录 Python、XGBoost、NumPy 和 SciPy 版本。

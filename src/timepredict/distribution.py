@@ -45,11 +45,29 @@ class LogNormal:
             shifted = 0.0 if age == 0 else float(log_ndtr((self.mu + self.sigma**2 - math.log(age)) / self.sigma))
             log_mean = self.mu + self.sigma**2 / 2 + shifted - ls
             mean = math.exp(log_mean) if age == 0 else age * math.expm1(log_mean - math.log(age))
-            capped = quad(lambda u: math.exp(self.log_survival(age + u) - ls), 0, horizon, epsabs=1e-8)[0]
+            p50, p90 = quantile(0.5), quantile(0.9)
+            log_tail_ratio = self.log_survival(age+horizon)-ls
+            within = -math.expm1(log_tail_ratio)
+            if horizon <= p50:
+                # The integrand stays >= 1/2 here. Normalize the interval so
+                # absolute integration tolerances also work for tiny horizons.
+                capped = horizon*quad(lambda v: math.exp(self.log_survival(age+horizon*v)-ls),
+                                      0., 1., epsabs=1e-10, epsrel=1e-10)[0]
+            else:
+                # A single integral over [0,H] can miss all probability mass
+                # when microsecond calls are capped at seconds. Use the exact
+                # truncated first moment, with stable differences in log space.
+                shifted_end = float(log_ndtr((self.mu+self.sigma**2-math.log(age+horizon))/self.sigma))
+                fraction = -math.expm1(shifted_end-shifted)
+                moment = math.exp(log_mean+math.log(fraction)) if fraction > 0 else 0.
+                capped = math.fsum((moment, -age*within, horizon*math.exp(log_tail_ratio)))
+            capped = min(capped, horizon, mean)
+            if capped <= 0:
+                raise ValueError("nonpositive_capped_cost")
             result = {
-                "remaining_p50_seconds": quantile(0.5),
-                "remaining_p90_seconds": quantile(0.9),
-                "prob_return_within_H": -math.expm1(self.log_survival(age + horizon) - ls),
+                "remaining_p50_seconds": p50,
+                "remaining_p90_seconds": p90,
+                "prob_return_within_H": within,
                 "expected_remaining_seconds": mean,
                 "expected_capped_remaining_seconds": capped,
             }

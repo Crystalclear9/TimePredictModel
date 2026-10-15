@@ -17,7 +17,7 @@
 | XGBoost normal AFT 和验证集统一 sigma | training.py / model.py | 实际 CPU 训练、原始 margin、秒单位恢复及独立加载 |
 | 精确和行政右删失标签 | snapshot / dataset.py | 事件摘要、身份/边界、匹配来源与 Agent 心跳、cutoff 时钟 |
 | 时间与完整 workflow 隔离、整工具留出 | split_rows / train | 工作流不交叉，留出工作流不进入词典或训练 |
-| 条件剩余 P50/P90、概率、均值及截断期望 | distribution.py | 48 组参数与独立 SciPy 生存函数、反函数、积分对照 |
+| 条件剩余 P50/P90、概率、均值及截断期望 | distribution.py | 48 组基础参数、微秒级成本以及320组跨尺度独立正态密度积分对照 |
 | 预测一次、缓存版本、等待时条件化 | Worker / WindowConsumer | 异步预测、迟到结果拒绝、age 更新、断网租约过期 |
 | 校准和窗口规则、unknown/影子不可加载 | service.py / client.py | 鉴权、租户隔离、状态降级、概率更新和候选判定 |
 | 特征与模型一起发布、门禁和原子切换 | model.py / release.py | 摘要、归档证据、CURRENT、提交前训练租约检查 |
@@ -57,6 +57,18 @@
 
 新增15项分页关闭/取消、处理器失效、游标合法和异常边界、Redis读取故障及输入/输出别名检查；原有正常通知的时间推进和租户隔离检查保留。
 
+## 跨入口、数值尺度与存储故障复核
+
+本次发现并复现了三类主线问题：
+
+1. 入口B的采集缺口/失联原先只影响B发出的调用，A发出但可能在B续接的调用仍可入窗并导出错误标签。现在保存故障时间区间，按两端时钟误差证明区间分离，阻断受影响候选及标签；恢复只放行区间后的新调用。支持迟到OUT、更早回返纠正及旧boot迟到事件，采集ID改为稳定的逻辑入口ID。
+2. 微秒级调用配秒级H时，直接在[0,H]积分会漏掉概率质量。一个复现中真实截断成本约6.96微秒，旧结果约2.46e-34秒。现在使用稳定截断矩，窄窗口在单位区间积分；新增320组合的独立Z~N(0,1)积分对照。
+3. 文件/目录fsync错误被忽略，正式发布复制的完整包也未同步。现在提交前同步文件与POSIX目录；CURRENT替换后的目录同步失败单独报告结果不确定，重训收据使用publication_outcome_uncertain。存储错误采用明确的故障注入，不是实际断电试验。
+
+新增12项跨入口与稳定身份检查、7项数值检查（其中一项覆盖320组合）及4项存储故障检查。原有正常训练、发布、租约取消和接口测试保留。旧版状态缺少故障边界时保守降级，迁移步骤见README。
+
+chronyc CSV字段布局另外对照了[上游输出函数](https://github.com/mlichvar/chrony/blob/master/client.c)，本次未发现字段偏移错误；这不代替真实chronyd和跨主机校时验收。
+
 ## 可复现验证
 
 ```bash
@@ -67,9 +79,9 @@ uv run python -m compileall -q src tests scripts deploy examples
 uv lock --check
 ```
 
-当前 181 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。
+当前 204 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
 
-补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist 和清理后的包入口。
+补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整204项测试并通过，未将同一套用例重复计数。
 
 ## 仍需目标环境证据
 

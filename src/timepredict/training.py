@@ -63,6 +63,9 @@ def snapshot(events, cutoff, heartbeat_ttl=30, cutoff_stamp=None):
     rows = []
     for record in state["records"].values():
         wf = workflow_key(record)
+        if record.get("observation_failure"):
+            excluded[record["observation_failure"]] += 1
+            continue
         if not record["valid"]:
             excluded[record["status"]] += 1
             continue

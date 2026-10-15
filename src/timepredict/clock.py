@@ -9,9 +9,11 @@ import uuid
 # 跟踪进程来源、启动身份、chrony 误差与系统时间跳变。
 class Clock:
     # 为当前进程生成启动标识；初始校时误差可显式注入。
-    def __init__(self, error_seconds=None):
+    def __init__(self, error_seconds=None, *, source_id=None):
+        if source_id is not None and (not isinstance(source_id, str) or not source_id):
+            raise ValueError("source_id must be a nonempty string")
         self.boot = uuid.uuid4().hex
-        self.source = os.environ.get("TIMEPREDICT_SOURCE", os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "host")) + f":{os.getpid()}"
+        self.source = source_id or (os.environ.get("TIMEPREDICT_SOURCE", os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "host")) + f":{os.getpid()}")
         self.error_seconds = error_seconds
         self.last = None
         self.jumped = False
