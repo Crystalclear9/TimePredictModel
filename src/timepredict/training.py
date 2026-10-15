@@ -1,5 +1,6 @@
 # 文件作用：AFT 训练和生存评估：事件快照、时间划分、删失标签、IPCW、基线与候选发布。
 import json
+import hashlib
 import math
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -49,9 +50,11 @@ def _curve_svg(series, title):
 
 
 # 只回放截取前发生且已观测事件；完整返回产生精确标签，完整观察等待产生右删失。
-def snapshot(events, cutoff, heartbeat_ttl=30):
+def snapshot(events, cutoff, heartbeat_ttl=30, cutoff_stamp=None):
     if not math.isfinite(cutoff) or heartbeat_ttl <= 0:
         raise ValueError("cutoff must be finite and heartbeat TTL positive")
+    events = list(events)
+    evidence_events = {e["event_id"]: e for e in events}
     state = empty_state()
     excluded = Counter()
     for event in events:
@@ -66,6 +69,11 @@ def snapshot(events, cutoff, heartbeat_ttl=30):
         if record["status"] == "returned":
             lower = upper = record["duration"]
         elif record["status"] == "waiting":
+            if (not cutoff_stamp or cutoff_stamp.get("utc") != cutoff or cutoff_stamp.get("jumped")
+                    or cutoff_stamp.get("error") is None or not math.isfinite(cutoff_stamp["error"])
+                    or not 0 <= cutoff_stamp["error"] <= .0025):
+                excluded["cutoff_clock_unverified"] += 1
+                continue
             active_sources = [s for s in state["sources"].values() if not s.get("retired")]
             if any(s.get("bad") or s.get("lost") or cutoff-s["last"]["utc"] > heartbeat_ttl for s in active_sources):
                 excluded["incomplete_observation"] += 1
@@ -92,9 +100,31 @@ def snapshot(events, cutoff, heartbeat_ttl=30):
         except UnsupportedInput:
             excluded["unsupported_input"] += 1
             continue
-        # 当前快照仅输出基础样本字段；正式 observed 训练要求的来源/工具 ID/边界证据未在此补齐。
+        out_event = evidence_events.get(record.get("out_event_id"))
+        return_event = evidence_events.get(record.get("return_event_id"))
+        formal = bool(out_event and out_event.get("source_kind") == "sglang" and
+                      (return_event is None or return_event.get("source_kind") == "sglang"))
+        # Right-censoring records an observation boundary, never a fictitious return.
+        mode = record.get("association_mode", "pending_serial")
+        serial_verified = record.get("serial_verified", record.get("serial_protocol", False))
+        evidence = {"out": out_event, "return": return_event}
+        if math.isinf(upper):
+            evidence["cutoff_stamp"] = cutoff_stamp
+            evidence["observation"] = [e for e in events if e["kind"] in ("heartbeat", "source_heartbeat")
+                                       and cutoff - heartbeat_ttl <= e["stamp"]["utc"] <= cutoff
+                                       and e.get("observed_at", e["stamp"]["utc"]) <= cutoff]
+        evidence_digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
+                                                    allow_nan=False).encode()).hexdigest()
         rows.append({"generation": record["generation"], "workflow": wf, "workflow_start": state["workflows"][wf]["start"],
-                     "workflow_end": state["workflows"][wf]["end"], "call": record["call"], "lower": lower, "upper": upper})
+                     "workflow_end": state["workflows"][wf]["end"], "call": record["call"], "lower": lower, "upper": upper,
+                     "label_kind": "sglang_return_observed" if formal else "unverified_event_snapshot",
+                     "association_mode": mode, "tool_call_id_verified": record.get("tool_call_id_verified", False),
+                     "serial_verified": serial_verified, "t_out": record["out"]["utc"],
+                     "t_return": record.get("return", {}).get("utc"), "observation_cutoff": cutoff if math.isinf(upper) else None,
+                     "observation_ttl_seconds": heartbeat_ttl if math.isinf(upper) else None,
+                     "out_stamp": record["out"], "return_stamp": record.get("return"),
+                     "source_manifest": {"kind": "sglang" if formal else "unverified", "evidence_sha256": evidence_digest},
+                     "event_evidence": evidence})
     return rows, dict(excluded)
 
 
@@ -261,7 +291,7 @@ def baseline_reports(train, test):
 
 
 # 校验来源，拟合训练动作族/词典，尝试多个 sigma 并按验证 best_score 选择 AFT 候选。
-def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), holdout_tools=(), data_kind="unspecified"):
+def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), holdout_tools=(), data_kind="unspecified", feature_mode="structured"):
     rows = validate_rows(rows)
     if threads <= 0 or rounds <= 0 or not sigmas or any(not math.isfinite(s) or s <= 0 for s in sigmas):
         raise ValueError("threads, rounds and sigma values must be positive")
@@ -288,11 +318,16 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
     for name in ("train", "validation"):
         if not any(math.isfinite(r["upper"]) for r in groups[name]):
             raise ValueError(name+" has no observed returns; collect complete observations before fitting")
-    action_families = ActionFamilies.fit(r["call"] for r in groups["train"])
-    for bucket in groups.values():
-        for row in bucket:
-            row["call"] = action_families.enrich(row["call"])
-    spec = FeatureSpec.fit(r["call"] for r in groups["train"])
+    if feature_mode not in ("structured", "semantic", "legacy_semantic"):
+        raise ValueError("invalid_feature_mode")
+    action_families = None
+    if feature_mode == "legacy_semantic":
+        action_families = ActionFamilies.fit(r["call"] for r in groups["train"])
+        for bucket in groups.values():
+            for row in bucket:
+                row["call"] = action_families.enrich(row["call"])
+        unseen = [{**r, "call": action_families.enrich(r["call"])} for r in unseen]
+    spec = FeatureSpec.fit((r["call"] for r in groups["train"]), feature_mode=feature_mode)
     # Public traces contain microsecond-scale spans. Train in microseconds to
     # keep XGBoost AFT away from denormal floating-point values, then shift the
     # returned margin back to seconds for all reports and serving.
@@ -302,12 +337,13 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
     for sigma in sigmas:
         params = {"objective": "survival:aft", "eval_metric": "aft-nloglik", "aft_loss_distribution": "normal",
                   "aft_loss_distribution_scale": sigma, "tree_method": "hist", "max_depth": 4,
-                  "eta": 0.05, "seed": 42, "nthread": threads, "device": "cpu"}
+                  "eta": 0.05, "seed": 42, "nthread": threads, "device": "cpu",
+                  "base_score": float(np.median([r["lower"]*time_scale for r in groups["train"] if math.isfinite(r["upper"])]))}
         evals_result = {}
         booster = xgb.train(params, train_data, num_boost_round=rounds, evals=[(train_data, "train"), (validation, "validation")],
                             evals_result=evals_result, early_stopping_rounds=30, verbose_eval=False)
-        candidates.append((float(booster.best_score), sigma, booster, evals_result))
-    # 现有实现按不同 sigma 的 XGBoost best_score 直接比较；此处记录行为，不代表比较规则已完成审计。
+        margins = booster.predict(validation, output_margin=True, iteration_range=(0, booster.best_iteration+1)) - math.log(time_scale)
+        candidates.append((nll(groups["validation"], margins, sigma), sigma, booster, evals_result))
     _, sigma, booster, evals_result = min(candidates, key=lambda v: v[0])
     # 取选定树前缀的 AFT margin，并减去 log(time_scale) 恢复秒单位。
     def predict(data):
@@ -324,7 +360,8 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
               "data_kind": data_kind, "label_kinds": dict(Counter(r.get("label_kind", "observed") for r in rows)),
               "data_digest": dataset_digest(rows), "dataset": describe(rows),
               "unknown_tool_test": assess(unseen) if unseen else {"status": "not_run", "reason": "pass --holdout-tool"},
-              "prediction_mode": "xgboost_aft", "family_priors": {}, "embedding_kind": spec.embedding_kind,
+              "prediction_mode": "xgboost_aft", "feature_mode": feature_mode, "family_priors": {}, "embedding_kind": spec.embedding_kind,
+              "label_provenance_checked": data_kind == "observed",
               "embedding_model": spec.embedding_model, "embedding_dim": spec.embedding_dim,
               "dataset_revision": next((row.get("dataset_revision") for row in rows if row.get("dataset_revision")), None),
               "converter_version": next((row.get("converter_version") for row in rows if row.get("converter_version")), None),
@@ -392,7 +429,7 @@ def dataset_digest(rows):
     from .features import canonical
     digest = sha256()
     for row in rows:
-        digest.update((canonical({**row, "upper": None if math.isinf(row["upper"]) else row["upper"]})+"\n").encode())
+        digest.update((canonical({**row, "upper": None if row["upper"] is None or math.isinf(row["upper"]) else row["upper"]})+"\n").encode())
     return digest.hexdigest()
 
 

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 from .semantic import SemanticEncoder
 
-VERSION = 3
+VERSION = 4
 MAX_BYTES = 256 * 1024
 MAX_DEPTH = 32
 
@@ -50,9 +50,11 @@ def parse_arguments(arguments):
 
 
 # 提取数值、布尔、字符串长度、数组长度、枚举指示和通用结构统计。
-def extract(call):
+def extract(call, use_action_family=True):
+    if not isinstance(call, dict) or not isinstance(call.get("name"), str) or not call["name"] or "arguments" not in call:
+        raise UnsupportedInput("invalid_call")
     args = parse_arguments(call["arguments"])
-    tool = call.get("action_family", call["name"])
+    tool = call.get("action_family", call["name"]) if use_action_family else call["name"]
     fields, stats = {}, Counter()
     stats["json_bytes"] = len(canonical(args).encode("utf-8"))
 
@@ -62,6 +64,10 @@ def extract(call):
 
     # 遍历参数树；布尔值先于数值判断，嵌套对象按排序后的字段处理。
     def walk(value, path, schema, depth):
+        if isinstance(schema, bool):
+            schema = {}  # Boolean JSON Schema nodes add no enum or property hints.
+        if not isinstance(schema, dict):
+            raise UnsupportedInput("invalid_schema")
         stats["max_depth"] = max(stats["max_depth"], depth)
         if value is None:
             kind = "null"
@@ -115,7 +121,12 @@ def extract(call):
                 put(path, "enum:" + canonical(choice), float(canonical(value) == canonical(choice)))
             put(path, "enum:unknown", float(all(canonical(value) != canonical(c) for c in schema["enum"])))
 
-    walk(args, "", call.get("schema", {}), 0)
+    try:
+        walk(args, "", call.get("schema", {}), 0)
+    except UnsupportedInput:
+        raise
+    except (AttributeError, TypeError, ValueError, UnicodeError) as exc:
+        raise UnsupportedInput("invalid_schema") from exc
     return fields, stats
 
 
@@ -133,40 +144,47 @@ class FeatureSpec:
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_revision: str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
     embedding_kind: str = "sentence_transformers"
+    # Legacy packages omit this field. New fits select structured explicitly.
+    feature_mode: str = "legacy_semantic"
 
     # 仅从传入的训练调用统计字段频率，最多保留 4096 列。
     @classmethod
-    def fit(cls, calls, max_fields=4096):
+    def fit(cls, calls, max_fields=4096, feature_mode="structured"):
+        if feature_mode not in ("structured", "semantic", "legacy_semantic"):
+            raise ValueError("invalid_feature_mode")
         counts, tools = Counter(), set()
         for call in calls:
-            fields, _ = extract(call)
+            fields, _ = extract(call, use_action_family=feature_mode == "legacy_semantic")
             counts.update(fields.keys())
-            tools.add(call.get("action_family", call["name"]))
+            tools.add(call.get("action_family", call["name"]) if feature_mode == "legacy_semantic" else call["name"])
+        if feature_mode == "structured":
+            return cls(sorted(tools), sorted(counts, key=lambda k: (-counts[k], k))[:max_fields],
+                       embedding_dim=0, embedding_kind="none", feature_mode=feature_mode)
         encoder = SemanticEncoder()
         spec = cls(sorted(tools), sorted(counts, key=lambda k: (-counts[k], k))[:max_fields],
                    embedding_dim=encoder.dim, embedding_model=encoder.model_name,
-                   embedding_revision=encoder.revision, embedding_kind=encoder.backend)
+                   embedding_revision=encoder.revision, embedding_kind=encoder.backend,
+                   feature_mode=feature_mode)
         object.__setattr__(spec, "_encoder", encoder)
         return spec
 
     # 按工具指示、未知工具列、语义向量、统计、结构字段顺序编码；缺失字段用 NaN。
     def transform(self, call):
-        if self.version != VERSION:
+        if self.version not in (3, VERSION):
             raise ValueError("feature_version_mismatch")
-        fields, stats = extract(call)
-        action = call.get("action_family", call["name"])
+        fields, stats = extract(call, use_action_family=self.feature_mode == "legacy_semantic")
+        action = call.get("action_family", call["name"]) if self.feature_mode == "legacy_semantic" else call["name"]
         values = [float(action == t) for t in self.tools]
         values += [float(action not in self.tools)]
-        encoder = getattr(self, "_encoder", None)
-        if encoder is None:
-            encoder = SemanticEncoder(self.embedding_model, revision=self.embedding_revision,
-                                      device="cpu")
+        if self.feature_mode != "structured":
+            encoder = getattr(self, "_encoder", None)
+            if encoder is None:
+                encoder = SemanticEncoder(self.embedding_model, revision=self.embedding_revision,
+                                          device="cpu")
+                object.__setattr__(self, "_encoder", encoder)
             if encoder.dim != self.embedding_dim or encoder.backend != self.embedding_kind:
                 raise ValueError("embedding_dimension_mismatch")
-            object.__setattr__(self, "_encoder", encoder)
-        if encoder.dim != self.embedding_dim or encoder.backend != self.embedding_kind:
-            raise ValueError("embedding_dimension_mismatch")
-        values += encoder.encode(call).tolist()
+            values += (encoder.encode_call(call) if self.feature_mode == "semantic" else encoder.encode(call)).tolist()
         values += [float(stats[k]) for k in STATS]
         values += [fields.get(k, float("nan")) for k in self.fields]
         return np.asarray(values, dtype=np.float32)

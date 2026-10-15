@@ -6,7 +6,7 @@ from pathlib import Path
 # 读取证据、区分本地/WSL/服务器验证状态，并写出禁止生产发布的审计报告。
 def run(output,evidence=None):
     evidence_path=Path(evidence) if evidence else Path(output).with_name("final-audit.json")
-    ev=json.loads(evidence_path.read_text()) if evidence_path.exists() else {}
+    ev=json.loads(evidence_path.read_text(encoding="utf-8")) if evidence_path.exists() else {}
     evidence_platform = str(ev.get("environment",{}).get("platform", ""))
     evidence_is_linux = "linux" in evidence_platform.lower() or "wsl" in evidence_platform.lower()
     verified = "verified_in_wsl" if evidence_is_linux else "implemented_local_only"
@@ -16,8 +16,10 @@ def run(output,evidence=None):
       "sentence_transformer":[verified if ev.get("checks",{}).get("sentence_transformer",{}).get("status")=="passed" else "not_verified","real encoder is required; no hashing fallback"],
       "redis_cas_streams":["verified_in_wsl" if ev.get("checks",{}).get("redis_real",{}).get("status")=="passed" else "not_verified","real Redis Streams/CAS evidence"],
       "sglang_gpu_protocol":["not_verified_server","requires pinned SGLang GPU service"],
-      "formal_return_labels":["missing","no authenticated SGLang return-label evidence is present"],
-      "gbdt_regression_contract":["implemented","XGBoost direct log-time regression is the replay primary; AFT remains a separate censoring diagnostic"],
+      "formal_return_labels":["implemented","event-backed exact/censored schema; real observations still require server evidence"],
+      "gbdt_regression_contract":["implemented","structured normal-AFT baseline; joint-semantic ablation is optional"],
+      "plugin_api":["implemented","versioned window/distribution/lease contract and scheduler-neutral consumer"],
+      "batch_retraining":["implemented","immutable event cutoff, renewed training lease and quality-gated promotion"],
       "accuracy_curve":["implemented","per-round P50/P90 relative-error hit rates"],
       "atomic_package":["implemented","file fsync and atomic best-model link"],
       "server_performance":["not_verified_server","P99 and throughput require target hosts"]}

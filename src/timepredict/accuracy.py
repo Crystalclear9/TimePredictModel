@@ -18,7 +18,7 @@ def render(rows, model_dir, output):
     import matplotlib.pyplot as plt
 
     model = Model(model_dir)
-    report = json.loads((Path(model_dir) / "report.json").read_text())
+    report = json.loads((Path(model_dir) / "report.json").read_text(encoding="utf-8"))
     rows = validate_rows(rows)
     if model.action_families:
         for row in rows:

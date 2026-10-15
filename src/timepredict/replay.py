@@ -13,7 +13,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "replay-1"
+VERSION = "replay-2"
 NAMES = ("sleep_tool", "http_tool", "file_tool", "database_tool")
 
 # 使用高分辨率单调计时器，秒为单位。
@@ -31,12 +31,15 @@ def generate(output, rows=5000, seed=42, concurrency=4):
     if (output / "samples.jsonl").exists():
         raise ValueError("refusing to overwrite an existing replay")
     rng = random.Random(seed)
+    utc_anchor, mono_anchor = time.time(), _tick()
+    def replay_utc():
+        return utc_anchor + (_tick()-mono_anchor)
     jobs = []
     # Multiple calls belong to the same workflow.  This is intentional: the
     # temporal splitter must be able to quarantine a whole workflow and the
     # test set must contain workflows never seen during fitting.
     calls_per_workflow = 10
-    workflow_count = max(500, (rows + calls_per_workflow - 1) // calls_per_workflow)
+    workflow_count = (rows + calls_per_workflow - 1) // calls_per_workflow
     workflow_starts = {}
     workflow_lock = threading.Lock()
     for i in range(rows):
@@ -57,12 +60,13 @@ def generate(output, rows=5000, seed=42, concurrency=4):
 
         # 接收模拟调用，在响应写出前记录 t_out，并通过 JSON 交给本地执行器。
         def do_POST(self):
+            ingress = _tick()
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             # The endpoint represents SGLang's completed response.  It emits
             # t_out before the Agent starts the tool, so the measured target
             # is exactly the post-response return interval.
             t_out = _tick()
-            body = json.dumps({"t_out": t_out}).encode()
+            body = json.dumps({"t_return": ingress} if request.get("kind") == "return" else {"t_out": t_out}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -75,7 +79,7 @@ def generate(output, rows=5000, seed=42, concurrency=4):
     # 执行文件/SQLite 或模拟工作量，加参数控制延时；本地 tool_end 同时作为 t_return。
     def execute(job):
         i, workflow, name, args, jitter = job
-        utc, start = time.time(), _tick()
+        utc, start = replay_utc(), _tick()
         with workflow_lock:
             workflow_starts.setdefault(workflow, utc)
         payload = json.dumps({"name": name, "arguments": args, "jitter": jitter}).encode()
@@ -100,13 +104,16 @@ def generate(output, rows=5000, seed=42, concurrency=4):
         delay = 0.008 + (NAMES.index(name) + 1) * 0.0008 + work * 0.00055
         time.sleep(max(0, delay + jitter))
         tool_end = _tick()
-        end = tool_end
+        followup = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/",
+                                         json.dumps({"kind": "return", "workflow": workflow}).encode())
+        with urllib.request.urlopen(followup, timeout=30) as response:
+            end = json.load(response)["t_return"]
         call = {"name": name, "arguments": args, "description": f"Controlled replay {name}",
                 "schema": {"type": "object", "properties": {k: {"type": "integer" if isinstance(v, int) else "string"} for k, v in args.items()}}}
         server_out = stamps.get("t_out", start)
         duration = end - server_out
         return {"generation": f"replay-{seed}-{i}", "workflow": workflow,
-                "workflow_start": workflow_starts[workflow], "workflow_end": utc + duration, "call": call,
+                "workflow_start": workflow_starts[workflow], "workflow_end": replay_utc(), "call": call,
                 "raw_arguments": json.dumps(args), "lower": duration, "upper": duration,
                 "label_kind": "observed_replay", "data_kind": "synthetic_replay",
                 "production_releasable": False, "converter_version": VERSION,
@@ -115,8 +122,17 @@ def generate(output, rows=5000, seed=42, concurrency=4):
                                "clock": "same_process_monotonic"}}
 
     try:
+        # Calls within one Agent are serial. Phase barriers give small replays usable
+        # temporal validation cohorts without relaxing whole-workflow quarantine.
+        workflows = [jobs[i:i+calls_per_workflow] for i in range(0, len(jobs), calls_per_workflow)]
+        def execute_workflow(work):
+            return [execute(job) for job in work]
+        first, second = int(workflow_count*.7), int(workflow_count*.85)
+        samples = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            samples = list(executor.map(execute, jobs))
+            for cohort in (workflows[:first], workflows[first:second], workflows[second:]):
+                for result in executor.map(execute_workflow, cohort):
+                    samples.extend(result)
     finally:
         server.shutdown()
         server.server_close()

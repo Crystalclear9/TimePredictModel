@@ -28,6 +28,7 @@ def main():
     snap = sub.add_parser("snapshot")
     snap.add_argument("--events", required=True)
     snap.add_argument("--cutoff", type=float, required=True, help="UTC Unix seconds")
+    snap.add_argument("--cutoff-clock-error", type=float, help="measured absolute UTC cutoff error in seconds; needed for right-censoring")
     snap.add_argument("--output", required=True)
     training = sub.add_parser("train")
     training.add_argument("--data", required=True)
@@ -36,6 +37,25 @@ def main():
     training.add_argument("--rounds", type=int, default=500)
     training.add_argument("--holdout-tool", action="append", default=[])
     training.add_argument("--data-kind", choices=["observed", "proxy", "synthetic", "unspecified"], default="unspecified")
+    training.add_argument("--feature-mode", choices=["structured", "semantic"], default="structured")
+    ablation = sub.add_parser("ablation", help="compare structured and joint-semantic AFT with identical splits/budgets")
+    ablation.add_argument("--data", required=True)
+    ablation.add_argument("--output", required=True)
+    ablation.add_argument("--data-kind", choices=["observed", "proxy", "synthetic"], required=True)
+    ablation.add_argument("--threads", type=int, default=4)
+    ablation.add_argument("--rounds", type=int, default=500)
+    ablation.add_argument("--holdout-tool", action="append", default=[])
+    retrain = sub.add_parser("retrain", help="export an immutable event cutoff, train and optionally quality-gate promotion")
+    retrain.add_argument("--redis-url", default=os.environ.get("TIMEPREDICT_REDIS_URL", "redis://127.0.0.1:6379/0"))
+    retrain.add_argument("--prefix", default="timepredict")
+    retrain.add_argument("--output", required=True)
+    retrain.add_argument("--serving-dir")
+    retrain.add_argument("--evidence")
+    retrain.add_argument("--policy")
+    retrain.add_argument("--threads", type=int, default=4)
+    retrain.add_argument("--rounds", type=int, default=500)
+    retrain.add_argument("--feature-mode", choices=["structured", "semantic"], default="structured")
+    retrain.add_argument("--holdout-tool", action="append", default=[])
     experiment = sub.add_parser("experiment", help="run pinned public proxy-label experiments")
     experiment.add_argument("--output", required=True)
     experiment.add_argument("--cache-dir")
@@ -85,7 +105,7 @@ def main():
         if args.models and args.shadow_candidate:
             parser.error("choose --models or --shadow-candidate")
         worker = Worker(store, args.models or args.shadow_candidate, clock, args.window_h, shadow=bool(args.shadow_candidate))
-        app = create_app(store, json.loads(Path(args.tokens_file).read_text()), clock, worker)
+        app = create_app(store, json.loads(Path(args.tokens_file).read_text(encoding="utf-8")), clock, worker)
         uvicorn.run(app, host=args.host, port=args.port)
     elif args.command == "export":
         from redis.asyncio import Redis
@@ -105,7 +125,12 @@ def main():
         asyncio.run(export_events())
     elif args.command == "snapshot":
         from .training import load_rows, snapshot
-        rows, excluded = snapshot(load_rows(args.events), args.cutoff)
+        cutoff_stamp = None
+        if args.cutoff_clock_error is not None:
+            if not math.isfinite(args.cutoff_clock_error) or not 0 <= args.cutoff_clock_error <= .0025:
+                parser.error("cutoff clock error must be finite and in [0,0.0025] seconds")
+            cutoff_stamp = {"utc": args.cutoff, "error": args.cutoff_clock_error, "jumped": False}
+        rows, excluded = snapshot(load_rows(args.events), args.cutoff, cutoff_stamp=cutoff_stamp)
         with Path(args.output).open("w", encoding="utf-8") as handle:
             for row in rows:
                 handle.write(json.dumps({**row, "upper": None if math.isinf(row["upper"]) else row["upper"]}, ensure_ascii=False, allow_nan=False) + "\n")
@@ -115,8 +140,16 @@ def main():
         if args.threads <= 0 or args.rounds <= 0:
             parser.error("threads and rounds must be positive")
         rows = load_rows(args.data)
-        version, report = train(rows, args.output, args.threads, args.rounds, holdout_tools=args.holdout_tool, data_kind=args.data_kind)
+        version, report = train(rows, args.output, args.threads, args.rounds, holdout_tools=args.holdout_tool, data_kind=args.data_kind, feature_mode=args.feature_mode)
         print(json.dumps({"version": version, "report": report}, ensure_ascii=False, allow_nan=False))
+    elif args.command == "ablation":
+        from .pipeline import ablation
+        from .training import load_rows
+        print(json.dumps(ablation(load_rows(args.data), args.output, data_kind=args.data_kind,
+                                  threads=args.threads, rounds=args.rounds, holdout_tools=args.holdout_tool), ensure_ascii=False, allow_nan=False))
+    elif args.command == "retrain":
+        from .pipeline import retrain_once
+        print(json.dumps(asyncio.run(retrain_once(args)), ensure_ascii=False, allow_nan=False))
     elif args.command == "check-data":
         from .training import inspect_dataset, load_rows
         result = inspect_dataset(load_rows(args.data))

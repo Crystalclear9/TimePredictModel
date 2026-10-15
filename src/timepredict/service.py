@@ -47,11 +47,11 @@ def window_rows(state, stamp, horizon, tenant=None):
                 row["model_version"] = prediction["model_version"]
                 row["p50_seconds"] = prediction.get("p50_seconds")
                 row["p90_seconds"] = prediction.get("p90_seconds")
-                # 缺少显式校准标记也视为未校准；当前 AFT predict 同样未设置此标记。
-                if not prediction.get("distribution_calibrated", False):
+                if not prediction.get("distribution_calibrated", False) and not (prediction.get("shadow") and "mu" in prediction):
                     row.update(status="unknown", reason="distribution_not_calibrated", in_window=False)
                 else:
                     row.update(LogNormal(prediction["mu"], prediction["sigma"]).summarize(age, horizon))
+                    row["status"] = "ready"
                     row["in_window"] = row["remaining_p50_seconds"] <= horizon and not prediction.get("shadow", False)
                     row["shadow"] = prediction.get("shadow", False)
             elif row["status"] != "pending_prediction":
@@ -59,7 +59,7 @@ def window_rows(state, stamp, horizon, tenant=None):
         except (ValueError, UnreliableDistribution) as exc:
             row.update(status="unknown", reason=str(exc))
         rows.append(row)
-    return {"snapshot_utc": stamp["utc"], "revision": state["revision"], "H_seconds": horizon, "records": rows}
+    return {"api_version": 1, "time_unit": "seconds", "snapshot_utc": stamp["utc"], "revision": state["revision"], "H_seconds": horizon, "records": rows}
 
 
 # 在 Redis 租约保护下处理事件和状态；API 副本可独立读取共享状态。
@@ -108,7 +108,8 @@ class Worker:
                 if self.model:
                     for attempt in range(3):
                         try:
-                            prediction, status = await asyncio.to_thread(self.model.predict, record["call"])
+                            model = self.model  # This generation keeps the model captured at inference start.
+                            prediction, status = await asyncio.to_thread(model.predict, record["call"])
                             break
                         except (TimeoutError, ConnectionError):
                             self.metrics["prediction_errors"] += 1
@@ -221,7 +222,7 @@ class Worker:
                         row["revision"] = record["revision"] = state["revision"]
                         notices.append({"action": "candidate_update", "tenant": row["tenant"], "key": row["key"],
                                         "generation": row["generation"], "revision": row["revision"], "H_seconds": self.horizon,
-                                        "snapshot_utc": now["utc"], "candidate": row})
+                                        "snapshot_utc": now["utc"], "snapshot_stamp": now, "candidate": row})
                     return state, notices
                 await self.store.mutate(refresh)
             except asyncio.CancelledError:
@@ -307,6 +308,18 @@ def create_app(store, tokens, clock=None, worker=None):
         raise HTTPException(401, "invalid credential")
 
     # 先读取通知游标，再读取快照，减少并发更新时消费端漏通知的风险。
+    @app.get("/internal/contract")
+    async def contract(namespace=Depends(tenant)):
+        return {"api_version": 1, "time_unit": "seconds", "target": "server_ingress - server_tool_response_out",
+                "association": "one outstanding single-tool round per tenant/workflow_id/agent_id",
+                "distribution": {"kind": "lognormal", "parameters": ["mu", "sigma"], "condition": "T > age_seconds"},
+                "window_rule": "remaining_p50_seconds <= H_seconds",
+                "scheduler_inputs": ["remaining_p50_seconds", "remaining_p90_seconds", "prob_return_within_H",
+                                     "expected_remaining_seconds", "expected_capped_remaining_seconds", "distribution", "age_seconds"],
+                "lease": "subtract measured response transit and expire locally; revisions reject stale updates",
+                "unknown": "never treat unknown or shadow rows as actionable",
+                "responsibility": "external scheduler supplies density scoring, KV node mapping and loading"}
+
     @app.get("/internal/window")
     async def window(H_seconds: float = Query(gt=0, allow_inf_nan=False), namespace=Depends(tenant)):
         try:
@@ -348,11 +361,27 @@ def create_app(store, tokens, clock=None, worker=None):
             candidate = item.get("candidate")
             if candidate:
                 # Never replay an expired actionable lease from the history stream.
-                left = candidate.get("expires_at_utc", 0)-now["utc"]-0.005
-                if left <= 0 or now.get("error") is None or now.get("jumped"):
-                    candidate.update(status="unknown", reason="expired_notice", in_window=False, valid_for_seconds=0.)
+                try:
+                    transit = elapsed(item["snapshot_stamp"], now)
+                    left = candidate.get("valid_for_seconds", 0)-transit-0.005
+                    failure = "expired_notice" if left <= 0 else None
+                except (KeyError, ValueError) as exc:
+                    left, failure = 0., "notice_clock_unverified" if isinstance(exc, KeyError) else str(exc)
+                if failure:
+                    candidate.update(status="unknown", reason=failure, in_window=False, valid_for_seconds=0.)
                 else:
                     candidate["valid_for_seconds"] = min(candidate.get("valid_for_seconds", 0), left)
+                    # Notices may sit in the history stream before being fetched.
+                    # Advance their age as well as TTL, so consumers do not condition on an old age.
+                    candidate["age_seconds"] = candidate.get("age_seconds", 0.)+transit
+                    prediction = candidate.get("distribution") or {}
+                    if candidate.get("status") == "ready" and "mu" in prediction:
+                        try:
+                            candidate.update(LogNormal(prediction["mu"], prediction["sigma"]).summarize(
+                                candidate["age_seconds"], item["H_seconds"]))
+                            candidate["in_window"] = candidate["remaining_p50_seconds"] <= item["H_seconds"] and not prediction.get("shadow", False)
+                        except (ValueError, UnreliableDistribution):
+                            candidate.update(status="unknown", reason="unsupported_tail", in_window=False)
             events.append({"id": ident, **item})
         return {"cursor": messages[-1][0] if messages else after,
                 "events": events}

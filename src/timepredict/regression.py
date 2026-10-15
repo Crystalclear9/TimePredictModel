@@ -74,7 +74,7 @@ def train_regression(rows, output, threads=4, rounds=500,
     for group in groups.values():
         for row in group:
             row["call"] = families.enrich(row["call"])
-    spec = FeatureSpec.fit(r["call"] for r in groups["train"])
+    spec = FeatureSpec.fit((r["call"] for r in groups["train"]), feature_mode="legacy_semantic")
     train_data, valid_data = _dmatrix(groups["train"], spec), _dmatrix(groups["validation"], spec)
     boosters, curves, scores = {}, {}, {}
     # P50 is the point predictor.  P90 is an independent quantile model.
@@ -224,7 +224,7 @@ def train_regression(rows, output, threads=4, rounds=500,
         raise
     try:
         manifest['sha256'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in staging.iterdir() if p.is_file()}
-        (staging / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+        (staging / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         for path in staging.iterdir():
             if path.is_file():
                 with path.open('ab') as handle:
@@ -280,7 +280,7 @@ class RegressionModel:
     # 校验必需文件、SHA-256、XGBoost 主版本与编码器，再载入两个 booster。
     def __init__(self, directory):
         root = Path(directory).resolve()
-        self.manifest = json.loads((root / 'manifest.json').read_text())
+        self.manifest = json.loads((root / 'manifest.json').read_text(encoding="utf-8"))
         m = self.manifest
         if m.get('package_version') != 2 or m.get('model_type') != 'xgboost_direct_log_time':
             raise ValueError('regression_package_incompatible')
@@ -294,11 +294,11 @@ class RegressionModel:
             raise ValueError('xgboost_major_version_mismatch')
         if m['embedding'] != encoder_contract():
             raise ValueError('encoder_contract_mismatch')
-        self.spec = FeatureSpec(**json.loads((root / 'features.json').read_text()))
-        package_embedding = json.loads((root / 'embedding-manifest.json').read_text())
+        self.spec = FeatureSpec(**json.loads((root / 'features.json').read_text(encoding="utf-8")))
+        package_embedding = json.loads((root / 'embedding-manifest.json').read_text(encoding="utf-8"))
         if package_embedding != m['embedding']:
             raise ValueError('embedding_manifest_mismatch')
-        self.families = ActionFamilies(**json.loads((root / 'action-families.json').read_text()))
+        self.families = ActionFamilies(**json.loads((root / 'action-families.json').read_text(encoding="utf-8")))
         self.boosters = {}
         self.calibration_offsets = {str(k): float(v) for k, v in m.get('calibration_offsets_log_seconds', {}).items()}
         for q in (.5, .9):

@@ -31,7 +31,7 @@ class Clock:
 
     # 同时记录 UTC 与单调秒数；两者增量差超过 5ms 时永久标记本实例已跳时。
     def stamp(self):
-        wall, mono = time.time(), time.monotonic()
+        wall, mono = time.time(), time.perf_counter_ns() / 1_000_000_000.0
         if self.last and abs((wall - self.last[0]) - (mono - self.last[1])) > 0.005:
             self.jumped = True
         self.last = (wall, mono)

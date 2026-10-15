@@ -1,0 +1,11 @@
+[Unit]
+Description=Batch return-time retraining every hour
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=timepredict-train.service
+
+[Install]
+WantedBy=timers.target

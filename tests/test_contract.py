@@ -1,6 +1,7 @@
 # 文件作用：基础契约测试：关联降级、参数拒绝、流式拼接、来源失联、动作匹配及分布数学。
 import math
 import unittest
+from unittest.mock import patch
 
 from timepredict.distribution import LogNormal
 from timepredict.features import FeatureSpec, UnsupportedInput
@@ -76,7 +77,8 @@ class ContractTests(unittest.TestCase):
 
     # 验证不相关操作输出未知/歧义与诊断排名。
     def test_action_family_reports_unknown_or_match(self):
-        families = ActionFamilies.fit([{"name": "search_documents", "description": "search documents",
+        with patch.dict("os.environ", {"TIMEPREDICT_TEST_ENCODER": "1"}):
+            families = ActionFamilies.fit([{"name": "search_documents", "description": "search documents",
                                         "schema": {"properties": {"query": {"type": "string"}}},
                                         "arguments": {"query": "x"}}])
         family, ranked, _ = families.match({"name": "unrelated_operation", "description": "rotate keys",

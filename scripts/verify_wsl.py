@@ -40,6 +40,7 @@ def _lifecycle():
     state,_=reduce_event(empty_state(),e)
     state,_=reduce_event(state,{**e,"event_id":"o","kind":"out","stamp":{**stamp,"utc":2.,"mono":2.}})
     if next(iter(state["records"].values()))["status"] != "waiting": raise AssertionError("prepared->waiting failed")
+    if next(iter(state["records"].values()))["prediction_status"] != "pending_prediction": raise AssertionError("prepared round cannot start prediction")
     return {"state":"prepared->waiting"}
 
 # 仅检查补丁包含预期钩子标记；不证明补丁已在上游应用或运行。

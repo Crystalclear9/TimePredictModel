@@ -40,7 +40,7 @@ def safe_hook(function):
 
 
 # 只从最近 assistant 工具轮次对应的连续 tool 消息收集匹配 ID。
-def latest_tool_ids(messages):
+def latest_tool_result(messages):
     ids = []
     for message in reversed(messages):
         role = message.get("role")
@@ -49,10 +49,14 @@ def latest_tool_ids(messages):
                 ids.append(message["tool_call_id"])
         elif role == "assistant":
             declared = {t.get("id") for t in message.get("tool_calls") or []}
-            return [i for i in ids if i in declared]
+            return [i for i in ids if i in declared], bool(ids)
         else:
-            return []
-    return []
+            return [], bool(ids)
+    return [], bool(ids)
+
+
+def latest_tool_ids(messages):
+    return latest_tool_result(messages)[0]
 
 
 # 累计一轮响应中的工具调用片段，并记录多选项、多工具和不完整输入原因。
@@ -101,11 +105,12 @@ class Capture:
         call = {**call, "description": definition.get("description", ""), "schema": definition.get("parameters", {})}
         try:
             # Bound expensive feature validation to the CPU service; check completeness here.
-            if not call["id"] or not call["name"] or not isinstance(json.loads(call["arguments"]), dict):
+            if not call["name"] or not isinstance(json.loads(call["arguments"]), dict):
                 self.reason = self.reason or "incomplete_arguments"
         except (ValueError, TypeError, RecursionError):
             self.reason = self.reason or "incomplete_arguments"
-        return {**self.identity, "call": call, "reason": self.reason}
+        return {**self.identity, "call": call, "reason": self.reason,
+                "source_kind": "sglang", "serial_protocol": self.reason is None}
 
 
 # 在上游认证/校验之后采集 ingress，tenant 由已认证 Bearer key 的 SHA-256 派生。
@@ -132,9 +137,10 @@ def accepted(request, raw_request):
     tools = {t["function"]["name"]: t["function"] for t in data.get("tools", []) if t.get("type") == "function"}
     capture = Capture(identity, tools, data.get("n", 1) == 1 and data.get("parallel_tool_calls", False) is False)
     state["timepredict_capture"] = capture
-    latest_ids = latest_tool_ids(data.get("messages", []))
+    latest_ids, ids_present = latest_tool_result(data.get("messages", []))
     observer.emit("ingress", {**identity, "latest_tool_ids": latest_ids,
-                                "tool_call_ids_present": bool(latest_ids)}, state["timepredict_received"])
+                                "tool_call_ids_present": ids_present, "source_kind": "sglang",
+                                "serial_protocol": capture.reason is None}, state["timepredict_received"])
 
 
 # 从非流式模型响应对象读取完整工具调用。

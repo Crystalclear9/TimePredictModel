@@ -4,6 +4,7 @@ from collections import OrderedDict
 import json
 import os
 import re
+import threading
 from typing import Any
 import numpy as np
 VERSION=3
@@ -51,6 +52,13 @@ def descriptor_text(call):
     return " ".join((str(call.get("name","")),str(call.get("description","")),
                      _schema_text(call.get("schema",{})),str(call.get("role","")),
                      " ".join(structure)))
+
+
+def joint_call_text(call):
+    """Joint name/description/actual-argument encoding; JSON retains types and array order."""
+    return json.dumps({"name": call["name"], "description": call.get("description", ""),
+                       "arguments": _canonical_arguments(call.get("arguments", {}))},
+                      sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 # 测试专用确定性哈希编码器，不能充当生产语义模型。
 class FrozenSemanticEncoder:
     """Test-only deterministic encoder; never selected for production."""
@@ -69,19 +77,40 @@ class FrozenSemanticEncoder:
     # 导出编码器后端、维度和版本契约。
     def to_dict(self): return {"kind":"test_hashing","version":self.version,"dim":self.dim}
 # 复用固定模型实例和文本向量 LRU 缓存；返回向量副本防止调用方污染缓存。
+def _synchronized_initialization(function):
+    def initialize(self, *args, **kwargs):
+        cls = type(self)
+        with cls._instances_lock:
+            if getattr(self, "_initialized", False):
+                return
+            try:
+                return function(self, *args, **kwargs)
+            except Exception:
+                if cls._instances.get(self._cache_key) is self:
+                    del cls._instances[self._cache_key]
+                raise
+    return initialize
+
+
 class SemanticEncoder:
     _instances = OrderedDict()
+    _instances_lock = threading.RLock()
     # 按模型、缓存目录、revision 与设备查找已初始化实例。
     def __new__(cls, model_name=DEFAULT_MODEL, cache_folder=None, revision=DEFAULT_REVISION, device="cpu", max_cache=2048):
-        key = (model_name, cache_folder or os.environ.get("TIMEPREDICT_EMBEDDING_CACHE"), revision, device)
-        cached = cls._instances.get(key)
-        if cached is not None:
-            cls._instances.move_to_end(key)
-            return cached
-        obj = super().__new__(cls)
-        obj._cache_key = key
-        return obj
+        key = (model_name, cache_folder or os.environ.get("TIMEPREDICT_EMBEDDING_CACHE"), revision, device,
+               os.environ.get("TIMEPREDICT_TEST_ENCODER") == "1")
+        with cls._instances_lock:
+            cached = cls._instances.get(key)
+            if cached is not None:
+                cls._instances.move_to_end(key)
+                return cached
+            obj = super().__new__(cls)
+            obj._cache_key = key
+            obj._cache_lock = threading.RLock()
+            cls._instances[key] = obj
+            return obj
     # 初始化编码器；真实后端必须符合固定模型契约，测试替身只由显式环境变量启用。
+    @_synchronized_initialization
     def __init__(self,model_name=DEFAULT_MODEL,cache_folder=None,revision=DEFAULT_REVISION,device="cpu",max_cache=2048):
         cache_key = self._cache_key
         if getattr(self, "_initialized", False):
@@ -117,13 +146,18 @@ class SemanticEncoder:
         return [tokenizer.decode(ids[i:i+limit],skip_special_tokens=True) for i in range(0,len(ids),limit)] or [""]
     # 编码每段文本、取均值并 L2 归一化，缓存结果；测试分支使用哈希替身。
     def encode_text(self,text):
+        with self._cache_lock:
+            return self._encode_text(text)
+
+    def _encode_text(self,text):
         key=str(text)
         if key in self._cache:
             value=self._cache.pop(key); self._cache[key]=value; return value.copy()
-        # 此分支把文本放进 arguments.text；测试编码器只看参数结构，因此当前不同文本可能得到相同向量。
+        # The explicit test backend hashes the text, rather than discarding actual values.
         if self.backend == "test_hashing":
-            vector = self.model.encode({"name": "", "arguments": {"text": key}})
+            vector = self.model.encode({"name": "", "description": key, "arguments": {}})
             self._cache[key] = vector
+            while len(self._cache) > self._max_cache: self._cache.popitem(last=False)
             return vector.copy()
         vectors=self.model.encode(self._chunks(key),normalize_embeddings=False,convert_to_numpy=True,device=self.device)
         vector=np.asarray(vectors,dtype=np.float32).mean(axis=0); norm=float(np.linalg.norm(vector)); vector=vector/norm if norm else vector
@@ -132,5 +166,9 @@ class SemanticEncoder:
         return vector.copy()
     # 将调用的操作描述编码为向量；实际算法由所在编码器类决定。
     def encode(self,call): return self.encode_text(descriptor_text(call))
+    def encode_call(self,call): return self.encode_text(joint_call_text(call))
+    def clear_cache(self):
+        with self._cache_lock:
+            self._cache.clear()
     # 导出编码器后端、维度和版本契约。
     def to_dict(self): return {"kind":self.backend,"model":self.model_name,"revision":self.revision,"dim":self.dim,"version":self.version,"device":self.device,"chunking":"tokenizer_capacity_mean_then_l2_normalize"}

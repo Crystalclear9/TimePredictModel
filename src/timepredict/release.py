@@ -67,7 +67,10 @@ def evaluate_gate(report, evidence, policy, version):
         if finite(actual) and finite(predicted):
             require(abs(actual-predicted) <= tolerance, label+": calibration error")
     require(report.get("data_kind") == "observed", "training provenance must be observed")
-    require(report.get("embedding_kind") == "sentence_transformers", "production release requires Sentence Transformer embeddings")
+    require(report.get("label_provenance_checked") is True and
+            set(report.get("label_kinds", {})) == {"sglang_return_observed"}, "formal label evidence must be validated")
+    require(report.get("feature_mode") == "structured" or report.get("embedding_kind") == "sentence_transformers",
+            "semantic release requires real Sentence Transformer embeddings")
     for split in ("validation", "test"):
         result = report.get(split, {})
         require(finite(result.get("nll")), split+": invalid likelihood")
@@ -105,12 +108,12 @@ def evaluate_gate(report, evidence, policy, version):
 
 
 # 门禁通过后复制候选及证据，验证正式包，再原子替换 CURRENT 文本指针。
-def promote(candidate, serving, evidence_file, policy_file):
+def promote(candidate, serving, evidence_file, policy_file, *, before_commit=None):
     candidate, serving = Path(candidate).resolve(), Path(serving).resolve()
     model = Model(candidate)
-    report = json.loads((candidate / "report.json").read_text())
-    policy = json.loads(Path(policy_file).read_text())
-    evidence = json.loads(Path(evidence_file).read_text())
+    report = json.loads((candidate / "report.json").read_text(encoding="utf-8"))
+    policy = json.loads(Path(policy_file).read_text(encoding="utf-8"))
+    evidence = json.loads(Path(evidence_file).read_text(encoding="utf-8"))
     decision = evaluate_gate(report, evidence, policy, model.version)
     if decision["decision"] != "approved":
         raise ValueError(canonical(decision))
@@ -119,7 +122,7 @@ def promote(candidate, serving, evidence_file, policy_file):
     serving.mkdir(parents=True, exist_ok=True)
     release_id = model.version + "-" + hashlib.sha256(canonical(decision).encode()).hexdigest()[:12]
     stage = Path(tempfile.mkdtemp(prefix=".staging-", dir=serving))
-    manifest = json.loads((candidate / "manifest.json").read_text())
+    manifest = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
     for name in (*manifest["sha256"], "manifest.json"):
         shutil.copyfile(candidate / name, stage / name)
     (stage / "promotion.json").write_text(canonical(decision), encoding="utf-8")
@@ -132,6 +135,12 @@ def promote(candidate, serving, evidence_file, policy_file):
         handle.write(release_id+"\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp, serving / "CURRENT")
+    try:
+        if before_commit is not None:
+            before_commit()
+        os.replace(temp, serving / "CURRENT")
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
     _fsync_directory(serving)
     return decision

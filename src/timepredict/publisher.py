@@ -55,10 +55,18 @@ class Publisher:
     async def run(self):
         while True:
             event = await self.queue.get()
+            try:
+                serialized = json.dumps(event, ensure_ascii=False, allow_nan=False)
+                serialized.encode("utf-8")
+            except (TypeError, ValueError, UnicodeError):
+                self.dropped += 1
+                self.queue.task_done()
+                logger.exception("timepredict non-JSON event dropped; following sequence exposes the gap")
+                continue
             delay = 0.1
             while True:
                 try:
-                    await self.redis.xadd(self.stream, {"data": json.dumps(event, ensure_ascii=False, allow_nan=False)})
+                    await self.redis.xadd(self.stream, {"data": serialized})
                     self.queue.task_done()
                     break
                 except asyncio.CancelledError:

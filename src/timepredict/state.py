@@ -41,13 +41,24 @@ def reduce_event(original, event, *, copy_state=True):
         notices.append({"action": action, "key": record["key"], "generation": record["generation"], "revision": state["revision"], "tenant": record["tenant"]})
 
     # 关闭记录并取消有效性；只有 pending 指向当前 generation 才删除索引。
-    def invalidate(record, status):
+    def invalidate(record, status, closed_stamp=None):
+        closing = closed_stamp or event["stamp"]
         record["status"] = status
         record["valid"] = False
-        record["closed_at"] = event["stamp"]["utc"]
+        record["closed_at"] = closing["utc"]
+        record["closed_stamp"] = closing
         if state["pending"].get(record["key"]) == record["generation"]:
             del state["pending"][record["key"]]
         notice(record, "remove")
+
+    def cancellation_for(record):
+        admitted = state.get("ingress_seen", {}).get(json.dumps([record["key"], record["request_id"]]), -float("inf"))
+        history = state.get("cancel_history", {}).get(record["key"], [])
+        applicable = [s for s in history if s["utc"] >= admitted]
+        if applicable:
+            return min(applicable, key=lambda s: s["utc"])
+        old = state.get("cancelled_agent_stamps", {}).get(record["key"])
+        return old if old and old["utc"] >= admitted else None
 
     stamp = event["stamp"]
     if event["kind"] == "source_lost":
@@ -99,17 +110,42 @@ def reduce_event(original, event, *, copy_state=True):
     if event["kind"] in ("cancel", "terminate", "expire"):
         if event["kind"] == "cancel":
             state["cancelled_agents"][key] = stamp["utc"]
+            state.setdefault("cancelled_agent_stamps", {})[key] = stamp
+            state.setdefault("cancel_history", {}).setdefault(key, []).append(stamp)
         if event["kind"] == "terminate":
-            state["workflows"][wf]["end"] = stamp["utc"]
+            workflow = state["workflows"][wf]
+            if workflow["end"] is None or stamp["utc"] < workflow["end"]:
+                workflow["end"], workflow["end_stamp"] = stamp["utc"], stamp
         for record in list(state["records"].values()):
             generation_matches = event["kind"] != "expire" or event.get("generation", record["generation"]) == record["generation"]
-            if generation_matches and (record["status"] == "waiting" or (record["status"] == "concurrent_conflict" and not record.get("return"))) and (record["key"] == key or (event["kind"] == "terminate" and workflow_key(record) == wf)):
-                invalidate(record, {"cancel": "cancelled", "terminate": "terminated", "expire": "observation_lost"}[event["kind"]])
+            eligible = record["status"] == "waiting" or (record["status"] == "concurrent_conflict" and not record.get("return")) or (record["status"] == "returned" and event["kind"] in ("cancel", "terminate"))
+            if generation_matches and eligible and (record["key"] == key or (event["kind"] == "terminate" and workflow_key(record) == wf)):
+                if event["kind"] == "cancel":
+                    closing = cancellation_for(record)
+                    if closing is None:
+                        continue  # A delayed cancellation of an earlier admitted round.
+                else:
+                    closing = state["workflows"][wf].get("end_stamp", stamp) if event["kind"] == "terminate" else stamp
+                if record["status"] == "returned":
+                    try:
+                        elapsed(closing, record["return"])
+                    except ValueError as exc:
+                        if str(exc) != "invalid_interval":
+                            invalidate(record, "lifecycle_clock_uncertain", closing)
+                        continue  # The proven return precedes this terminal event.
+                invalidate(record, {"cancel": "cancelled", "terminate": "terminated", "expire": "observation_lost"}[event["kind"]], closing)
         return state, notices
 
     # 关联续接请求并计算时间标签；明确 ID 优先，无 ID 时允许串行降级且标记 degraded。
     def close(record, incoming):
-        if record["status"] not in ("waiting", "concurrent_conflict") or record.get("return") or incoming["request_id"] == record["request_id"]:
+        recovered = False
+        if record["status"] in ("cancelled", "terminated") and record.get("closed_stamp"):
+            try:
+                # Event transport order cannot override a proven earlier ingress boundary.
+                recovered = elapsed(incoming["stamp"], record["closed_stamp"]) > 0
+            except ValueError:
+                pass
+        if (record["status"] not in ("waiting", "concurrent_conflict") and not recovered) or record.get("return") or incoming["request_id"] == record["request_id"]:
             return False
         # Under the serial protocol the tenant/workflow/agent key identifies
         # the only outstanding round. If the continuation includes tool IDs,
@@ -124,23 +160,30 @@ def reduce_event(original, event, *, copy_state=True):
                                                "at": incoming["stamp"]}
             record["status_reason"] = "historical_tool_result" if incoming.get("historical_tool_ids") else "association_mismatch"
             return False
-        cancelled = state["cancelled_agents"].get(key)
-        admitted = state["ingress_seen"].get(json.dumps([key, record["request_id"]]), -float("inf"))
-        if cancelled is not None and admitted <= cancelled <= incoming["stamp"]["utc"]:
-            invalidate(record, "cancelled")
+        cancelled = cancellation_for(record)
+        if cancelled is not None and cancelled["utc"] <= incoming["stamp"]["utc"]:
+            invalidate(record, "cancelled", cancelled)
             return True
         ended = state["workflows"][wf]["end"]
         if ended is not None and ended <= incoming["stamp"]["utc"]:
-            invalidate(record, "terminated")
+            invalidate(record, "terminated", state["workflows"][wf].get("end_stamp"))
             return True
         # Old requests must never consume a newer pending generation.
         if incoming["stamp"]["utc"] + 0.005 < record["out"]["utc"]:
             return False
         record["return"] = incoming["stamp"]
+        if recovered:
+            record["valid"] = True
+        record["return_event_id"] = incoming["event_id"]
+        record["return_event"] = copy.deepcopy(incoming)
+        record["return_source_kind"] = incoming.get("source_kind")
         record["return_request_id"] = incoming["request_id"]
         record["association_mode"] = "tool_call_id" if supplied else "serial_fallback"
         record["association_confidence"] = "verified" if supplied else "degraded"
         record["tool_call_id_verified"] = supplied
+        record["serial_verified"] = bool(record.get("serial_protocol") and incoming.get("serial_protocol"))
+        if not supplied and record["serial_verified"]:
+            record["association_confidence"] = "verified_serial_protocol"
         record["closed_at"] = incoming["stamp"]["utc"]
         try:
             duration = elapsed(record["out"], incoming["stamp"])
@@ -174,8 +217,15 @@ def reduce_event(original, event, *, copy_state=True):
                     separate = elapsed(end, record["out"]) >= 0
                 except ValueError as exc:
                     if str(exc) == "invalid_interval":
+                        # Retain the evidence pair so a corrected serial association can
+                        # withdraw only conflicts derived from that provisional pairing.
+                        prior = next((r for r in group if r.get("return") == end), group[-1])
+                        cause = [prior["generation"], record["generation"]]
                         for member in [*group, record]:
                             member["conflict_confirmed"] = True
+                            causes = member.setdefault("conflict_causes", [])
+                            if cause not in causes:
+                                causes.append(cause)
             if separate:
                 groups.append(group)
                 group = []
@@ -209,16 +259,72 @@ def reduce_event(original, event, *, copy_state=True):
                 elif record["status"] == "returned":
                     record["valid"] = True
 
+    def correct_association(incoming):
+        # With no tool ID, transport delivery may present a later continuation first.
+        # The earliest proven ingress after OUT is the serial successor; revise a
+        # provisional later match and return it to the orphan pool for its own round.
+        for record in state["records"].values():
+            if (record["key"] != key or record.get("association_mode") not in ("serial_fallback", "tool_call_id")
+                    or not record.get("return_event") or record["request_id"] == incoming["request_id"]
+                    or record["status"] not in ("returned", "concurrent_conflict", "cancelled", "terminated")):
+                continue
+            supplied = incoming.get("tool_call_ids_present", bool(incoming.get("latest_tool_ids")))
+            if record.get("association_mode") == "tool_call_id" and not supplied:
+                continue
+            if supplied and record["call"].get("id") not in (incoming.get("latest_tool_ids") or []):
+                continue
+            try:
+                if elapsed(record["out"], incoming["stamp"]) <= 0 or elapsed(incoming["stamp"], record["return"]) <= 0:
+                    continue
+            except ValueError:
+                continue
+            state["orphans"].setdefault(key, []).append(record["return_event"])
+            for field in ("return", "return_event", "return_event_id", "return_request_id", "return_source_kind",
+                          "duration", "association_mode", "association_confidence", "tool_call_id_verified", "serial_verified"):
+                record.pop(field, None)
+            record["status"], record["valid"] = "waiting", True
+            for member in state["records"].values():
+                causes = member.get("conflict_causes")
+                if causes is not None:
+                    member["conflict_causes"] = [c for c in causes if record["generation"] not in c]
+                    member["conflict_confirmed"] = bool(member["conflict_causes"])
+            break
+
     kind = event["kind"]
     if kind == "ingress":
         request_key = json.dumps([key, event["request_id"]])
+        ingress_stamps = state.setdefault("ingress_stamps", {})
         if request_key in state["ingress_seen"]:
-            return state, notices
+            previous = ingress_stamps.get(request_key)
+            if previous is None:
+                return state, notices
+            try:
+                if elapsed(stamp, previous) <= 0:
+                    return state, notices
+            except ValueError:
+                return state, notices
         state["ingress_seen"][request_key] = stamp["utc"]
+        ingress_stamps[request_key] = stamp
+        correct_association(event)
         candidates = sorted((r for r in state["records"].values() if r["key"] == key), key=lambda r: r["out"]["utc"], reverse=True)
         for record in candidates:
             if close(record, event):
                 reconcile_intervals()
+                leftovers = []
+                queue = sorted(state["orphans"].pop(key, []), key=lambda e: e["stamp"]["utc"])
+                while queue:
+                    orphan = queue.pop(0)
+                    correct_association(orphan)
+                    choices = sorted((r for r in state["records"].values() if r["key"] == key),
+                                     key=lambda r: r["out"]["utc"], reverse=True)
+                    if any(close(r, orphan) for r in choices):
+                        reconcile_intervals()
+                    else:
+                        leftovers.append(orphan)
+                    queue.extend(state["orphans"].pop(key, []))
+                    queue.sort(key=lambda e: e["stamp"]["utc"])
+                if leftovers:
+                    state["orphans"][key] = leftovers
                 return state, notices
         # Buffer unmatched returns, including returns arriving before their OUT event.
         state["orphans"].setdefault(key, []).append(event)
@@ -235,20 +341,23 @@ def reduce_event(original, event, *, copy_state=True):
         return state, notices
     if kind == "out":
         gen = hashlib.sha256((key + "/" + event["request_id"]).encode()).hexdigest()
+        prepared = None
         if gen in state["records"]:
             existing = state["records"][gen]
-            # 当前 prepared→out 分支直接激活后返回；不会执行下方新建 out 的完整调和逻辑。
             if existing.get("status") == "prepared":
-                existing["out"] = stamp; existing["call"] = event["call"]; existing["valid"] = True
-                existing["status"] = "waiting"; existing["lifecycle_state"] = "waiting"; existing["lifecycle"].append("waiting")
-                state["pending"][key] = gen; notice(existing, "update"); return state, notices
-            return state, notices
+                prepared = existing
+            else:
+                return state, notices
         if gen in state["tombstones"]: return state, notices
         record = {"key": key, "generation": gen, "tenant": event["tenant"], "workflow_id": event["workflow_id"],
                   "agent_id": event["agent_id"], "request_id": event["request_id"], "call": event["call"],
                   "out": stamp, "status": "waiting", "valid": True, "prediction": None,
                   "prediction_status": "pending_prediction", "workflow_start": state["workflows"][wf]["start"],
                   "lifecycle": ["waiting"], "lifecycle_state": "waiting"}
+        record.update(out_event_id=event["event_id"], source_kind=event.get("source_kind"),
+                      serial_protocol=event.get("serial_protocol", False))
+        if prepared:
+            record["lifecycle"] = prepared["lifecycle"] + ["waiting"]
         state["records"][gen] = record
         if state["sources"].get(source_key, {}).get("bad"):
             invalidate(record, "observation_gap")
@@ -268,13 +377,12 @@ def reduce_event(original, event, *, copy_state=True):
         if record["status"] != "waiting":
             reconcile_intervals()
             return state, notices
-        cancelled = state["cancelled_agents"].get(key)
-        admitted = state["ingress_seen"].get(json.dumps([key, event["request_id"]]), -float("inf"))
-        if cancelled is not None and admitted <= cancelled:
-            invalidate(record, "cancelled")
+        cancelled = cancellation_for(record)
+        if cancelled is not None:
+            invalidate(record, "cancelled", cancelled)
             return state, notices
         if state["workflows"][wf]["end"] is not None:
-            invalidate(record, "terminated")
+            invalidate(record, "terminated", state["workflows"][wf].get("end_stamp"))
             return state, notices
         reconcile_intervals()
         if record["status"] == "waiting":
@@ -322,4 +430,16 @@ def compact(state, now):
         if now-timestamp > 7*86400:
             del state["heartbeats"][key]
             state.get("heartbeat_stamps", {}).pop(key, None)
+    for key in list(state.get("cancelled_agent_stamps", {})):
+        if key not in state["cancelled_agents"]:
+            del state["cancelled_agent_stamps"][key]
+    for key in list(state.get("ingress_stamps", {})):
+        if key not in state["ingress_seen"]:
+            del state["ingress_stamps"][key]
+    for key, stamps in list(state.get("cancel_history", {}).items()):
+        recent = [s for s in stamps if now-s["utc"] <= 7*86400]
+        if recent:
+            state["cancel_history"][key] = recent
+        else:
+            del state["cancel_history"][key]
     return state, []

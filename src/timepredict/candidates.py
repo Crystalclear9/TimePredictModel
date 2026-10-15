@@ -6,13 +6,14 @@ import time
 # 保存可执行候选、各轮版本及全量快照版本下界。
 class CandidateCache:
     # 初始化版本索引；允许注入单调时钟以便确定性验证。
-    def __init__(self, monotonic=time.monotonic):
+    def __init__(self, monotonic=time.perf_counter):
         self.clock = monotonic
         self.records = {}
         self.floor = 0
         self.revisions = {}
         self.key_revisions = {}
         self.high_water = 0
+        self.snapshot_stamp = None
 
     # 从有效期扣除网络往返时间；仅缓存 ready 且已入窗的记录。
     def _put(self, row, roundtrip_seconds):
@@ -25,7 +26,14 @@ class CandidateCache:
     # 接受足够新的全量快照，重建缓存并设置旧通知过滤下界。
     def snapshot(self, snapshot, roundtrip_seconds=0.):
         if snapshot["revision"] < self.high_water:
-            return
+            return False
+        stamp = snapshot.get("snapshot_utc")
+        if self.snapshot_stamp is not None and stamp is not None and snapshot["revision"] == self.floor:
+            if stamp <= self.snapshot_stamp:
+                return False
+        if stamp is None and snapshot["revision"] == self.floor and self.snapshot_stamp is not None:
+            return False
+        self.snapshot_stamp = stamp if stamp is not None else float("-inf")
         self.high_water = snapshot["revision"]
         self.records.clear()
         self.revisions.clear()
@@ -35,6 +43,7 @@ class CandidateCache:
             self.revisions[(row["key"], row["generation"])] = row["revision"]
             self.key_revisions[row["key"]] = row["revision"]
             self._put(row, roundtrip_seconds)
+        return True
 
     # 按轮次及业务键版本过滤更新；移除通知只删除同一 generation。
     def notice(self, item, roundtrip_seconds=0.):
@@ -44,6 +53,8 @@ class CandidateCache:
         self.revisions[identity] = item["revision"]
         self.high_water = max(self.high_water, item["revision"])
         if item["action"] == "remove":
+            # A newer round's tombstone also fences delayed updates of older rounds.
+            self.key_revisions[item["key"]] = max(self.key_revisions.get(item["key"], 0), item["revision"])
             current = self.records.get(item["key"])
             if current and current[0]["generation"] == item["generation"]:
                 del self.records[item["key"]]

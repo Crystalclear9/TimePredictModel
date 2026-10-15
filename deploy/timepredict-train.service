@@ -1,0 +1,11 @@
+[Unit]
+Description=Train a candidate from observed SGLang return events
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=timepredict
+WorkingDirectory=/opt/timepredict
+EnvironmentFile=/etc/timepredict/service.env
+ExecStart=/opt/timepredict/.venv/bin/timepredict retrain --output /var/lib/timepredict/training --rounds 500 --feature-mode structured
+NoNewPrivileges=true

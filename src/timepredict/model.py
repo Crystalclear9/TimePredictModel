@@ -5,6 +5,7 @@ import math
 import os
 import platform
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -49,22 +50,38 @@ class Model:
         root = Path(directory)
         pointer = root / "CURRENT"
         if pointer.exists():
-            root = root / pointer.read_text().strip()
-        manifest = json.loads((root / "manifest.json").read_text())
-        # 当前直接回归分支提前返回，未执行下方 require_promoted 的发布证据检查。
+            root = root / pointer.read_text(encoding="utf-8").strip()
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         if manifest.get("model_type") == "xgboost_direct_log_time":
+            if require_promoted:
+                raise ValueError("direct_quantile_package_not_production_releasable")
             from .regression import RegressionModel
             self._regression = RegressionModel(root)
             self.version = manifest.get("package_version", 1)
             self.prediction_mode = "direct_quantiles_uncalibrated"
             return
-        if require_promoted:
-            promotion = json.loads((root / "promotion.json").read_text())
+        self.distribution_calibrated = False
+        self.acceptance_expires_at = 0.0
+        if (root / "promotion.json").exists():
+            promotion = json.loads((root / "promotion.json").read_text(encoding="utf-8"))
             if promotion.get("decision") != "approved" or promotion.get("manifest_sha256") != hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest():
                 raise ValueError("model_not_approved")
             for name, field in (("acceptance.json", "evidence_sha256"), ("gate-policy.json", "policy_sha256")):
                 if promotion.get(field) != hashlib.sha256((root / name).read_bytes()).hexdigest():
                     raise ValueError("promotion_evidence_mismatch")
+            # Recheck the archived reports/evidence. A marker alone cannot authorize scheduling.
+            from .release import evaluate_gate
+            decision = evaluate_gate(json.loads((root / "report.json").read_text(encoding="utf-8")),
+                                     json.loads((root / "acceptance.json").read_text(encoding="utf-8")),
+                                     json.loads((root / "gate-policy.json").read_text(encoding="utf-8")), manifest["version"])
+            if decision["decision"] != "approved":
+                raise ValueError("model_acceptance_expired_or_invalid")
+            self.distribution_calibrated = True
+            evidence = json.loads((root / "acceptance.json").read_text(encoding="utf-8"))
+            policy = json.loads((root / "gate-policy.json").read_text(encoding="utf-8"))
+            self.acceptance_expires_at = evidence["created_at"] + policy["evidence_max_age_seconds"]
+        elif require_promoted:
+            raise ValueError("model_not_approved")
         for filename, digest in manifest["sha256"].items():
             if hashlib.sha256((root / filename).read_bytes()).hexdigest() != digest:
                 raise ValueError("model_checksum_mismatch")
@@ -72,20 +89,20 @@ class Model:
             raise ValueError("feature_checksum_mismatch")
         if manifest["dependencies"]["xgboost"].split(".")[0] != xgb.__version__.split(".")[0]:
             raise ValueError("xgboost_major_version_mismatch")
-        self.spec = FeatureSpec(**json.loads((root / "features.json").read_text()))
+        self.spec = FeatureSpec(**json.loads((root / "features.json").read_text(encoding="utf-8")))
         embedding_path = root / "embedding-manifest.json"
         if embedding_path.exists():
-            embedding = json.loads(embedding_path.read_text())
+            embedding = json.loads(embedding_path.read_text(encoding="utf-8"))
             if (embedding.get("version") != self.spec.embedding_version or
                     embedding.get("dim") != self.spec.embedding_dim or
                     embedding.get("model") != self.spec.embedding_model or
                     embedding.get("revision") != self.spec.embedding_revision or
                     embedding.get("kind") != self.spec.embedding_kind):
                 raise ValueError("embedding_manifest_mismatch")
-        self.action_families = ActionFamilies(**json.loads((root / "action-families.json").read_text())) if (root / "action-families.json").exists() else None
+        self.action_families = ActionFamilies(**json.loads((root / "action-families.json").read_text(encoding="utf-8"))) if (root / "action-families.json").exists() else None
         if self.action_families and (self.action_families.embedding_kind != self.spec.embedding_kind or self.action_families.embedding_dim != self.spec.embedding_dim or self.action_families.embedding_revision != self.spec.embedding_revision):
             raise ValueError("action_embedding_backend_mismatch")
-        if self.spec.version != 3:
+        if self.spec.version not in (3, 4):
             raise ValueError("feature_version_mismatch")
         self.booster = xgb.Booster()
         self.booster.load_model(root / "model.ubj")
@@ -99,7 +116,25 @@ class Model:
             raise ValueError("feature_dimension_mismatch")
 
     # 直接回归返回未校准的 P50/P90；AFT 返回 mu/sigma，输入不支持时返回状态原因。
+    def _aft_prediction(self, mu, sigma, unknown_tool=False):
+        from .distribution import LogNormal
+        try:
+            LogNormal(mu, sigma)
+            p50, p90 = math.exp(mu), math.exp(mu+sigma*1.2815515655446004)
+            if p50 <= 0 or not math.isfinite(p90):
+                raise ValueError("nonfinite_result")
+        except (ValueError, OverflowError):
+            return None, "nonfinite_result"
+        return {"mu": mu, "sigma": sigma, "model_version": self.version,
+                "feature_version": self.spec.version, "feature_mode": self.spec.feature_mode,
+                "distribution_kind": "lognormal", "time_unit": "seconds",
+                "p50_seconds": p50, "p90_seconds": p90,
+                "distribution_calibrated": self.distribution_calibrated,
+                "unknown_tool": unknown_tool}, "ready"
+
     def predict(self, call):
+        if not hasattr(self, "_regression") and self.distribution_calibrated and time.time() > self.acceptance_expires_at:
+            return None, "model_acceptance_expired"
         if hasattr(self, "_regression"):
             try:
                 p50, p90 = self._regression.quantiles(call)
@@ -116,7 +151,7 @@ class Model:
             row = self.spec.transform(call)
         except UnsupportedInput:
             return None, "unsupported_input"
-        if call["name"] not in self.spec.tools:
+        if call["name"] not in self.spec.tools and self.spec.feature_mode == "legacy_semantic":
             action = call.get("action_family")
             if not action or action not in self.spec.tools:
                 return None, "unknown_tool"
@@ -124,11 +159,11 @@ class Model:
         if self.prediction_mode == "family_prior" and action in self.family_priors:
             mu = float(self.family_priors[action]["mu"])
             sigma = float(self.family_priors[action]["sigma"])
-            return {"mu": mu, "sigma": sigma, "model_version": self.version}, "ready"
+            return self._aft_prediction(mu, sigma)
         mu = float(self.booster.predict(xgb.DMatrix(row.reshape(1, -1)), output_margin=True, iteration_range=(0, self.best_iteration + 1))[0]) - float(np.log(self.time_scale))
         if not np.isfinite(mu):
             return None, "nonfinite_result"
-        return {"mu": mu, "sigma": self.sigma, "model_version": self.version}, "ready"
+        return self._aft_prediction(mu, self.sigma, call["name"] not in self.spec.tools)
 
 
 # 在 staging 写入并刷新 AFT 模型、特征、清单与报告，再原子重命名为不可变候选版本。

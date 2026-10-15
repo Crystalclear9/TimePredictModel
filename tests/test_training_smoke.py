@@ -21,13 +21,15 @@ class TrainingSmoke(unittest.TestCase):
         root = Path(tempfile.mkdtemp())
         version, report = train(rows, root, threads=1, rounds=3, sigmas=(0.5,), data_kind="synthetic")
         files = {path.name for path in (root / version).iterdir()}
-        self.assertTrue({"model.ubj", "features.json", "action-families.json", "embedding-manifest.json",
+        self.assertTrue({"model.ubj", "features.json", "embedding-manifest.json",
                          "manifest.json", "report.json", "dataset-manifest.json"} <= files)
         self.assertIn("accuracy_curves", report)
         loaded = Model(root / version)
         prediction, status = loaded.predict({"name": "search", "arguments": {}, "schema": {}})
         self.assertEqual(status, "ready")
         self.assertTrue(prediction["model_version"] == loaded.version)
+        self.assertEqual(loaded.spec.feature_mode, "structured")
+        self.assertEqual(loaded.spec.embedding_dim, 0)
 
 
 if __name__ == "__main__":
