@@ -69,6 +69,17 @@
 
 chronyc CSV字段布局另外对照了[上游输出函数](https://github.com/mlichvar/chrony/blob/master/client.c)，本次未发现字段偏移错误；这不代替真实chronyd和跨主机校时验收。
 
+## 模型包与门禁追加复核
+
+本轮先新增失败用例，再修复以下问题：
+
+1. 清单漏列关键文件仍能加载，未列入摘要的动作适配文件也会影响行为。现在要求模型、特征和报告受摘要覆盖；v3包还要求编码器与数据清单，行为文件不得从清单外加载。包JSON拒绝NaN、Infinity及指数溢出。
+2. 普通回归Booster、错误sigma、最佳迭代或时间缩放能被当作AFT加载。现在核对保存模型的normal AFT目标及scale、树前缀和训练报告，拒绝不一致配置及未知模式。
+3. CURRENT可以指向目录外，附带材料可以覆盖模型文件或写到stage外。现在限制指针为目录内直接子目录，材料名必须为平面文件名并禁止覆盖核心文件，Windows大小写别名也拒绝。原先材料变化不改变版本，导致新内容被旧包静默替代；现在材料、曲线和动作适配配置一并参与内容版本计算。
+4. 门禁曾接受无限支持量、越界概率、负Brier及布尔零计数，部分非对象报告段还会抛出类型异常。现在检查数值范围、样本整数类型、有效样本量上界和计数类型，异常报告返回拒绝。
+
+新增41项模型包和门禁边界检查，模型相关用例使用真实CPU训练/加载，门禁指标使用明确的合成夹具；它们不构成实际服务器验收。原有正式标签训练、门禁拒绝/批准、原子发布、UTF-8包加载及存储故障测试仍通过。摘要检查不是签名认证，不能证明外部提供的训练报告或服务器证据真实。
+
 ## 可复现验证
 
 ```bash
@@ -79,9 +90,9 @@ uv run python -m compileall -q src tests scripts deploy examples
 uv lock --check
 ```
 
-当前 204 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
+当前 245 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
 
-补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整204项测试并通过，未将同一套用例重复计数。
+补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整245项测试并通过，未将同一套用例重复计数。
 
 ## 仍需目标环境证据
 

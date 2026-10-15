@@ -98,7 +98,9 @@ uv run timepredict serve --window-h 2 --tokens-file /etc/timepredict/tokens.json
 uv run timepredict promote --candidate candidates/VERSION --serving-dir models --evidence server-acceptance.json --policy deploy/gate-policy.json
 ```
 
-正式标签、校准/基线/样本支持及对应版本的服务器验收全部通过，才原子更新 CURRENT。加载校验包摘要、特征契约和归档证据，之后才设置 distribution_calibrated=true。等待中的调用保留原预测版本。证据过期后不再对新调用发出可用预测。P99、吞吐和校准门槛是验收目标，不是已测得结果。
+正式标签、校准/基线/样本支持及对应版本的服务器验收全部通过，才原子更新 CURRENT。加载要求关键文件均列入摘要清单，核对实际 normal AFT 目标、sigma、最佳迭代、时间缩放及报告/特征契约，再验证归档证据。CURRENT 只允许指向正式目录内的直接子目录。附带材料不能越界或覆盖核心文件，其内容也参与候选版本计算。摘要用于检测不一致，包及验收材料仍须来自可信来源。
+
+门禁拒绝非有限支持量、非整数样本数、超过样本数的有效样本量、越界概率、负 Brier 和布尔错误计数；非对象报告段返回拒绝。通过后才设置 distribution_calibrated=true。等待中的调用保留原预测版本。证据过期后不再对新调用发出可用预测。P99、吞吐和校准门槛是验收目标，不是已测得结果。
 
 候选及正式发布文件均在切换前执行文件同步，POSIX 同时同步目录；同步失败不再被忽略。若 CURRENT 已替换但最终目录同步失败，报告 `PromotionCommitUncertain`，需要核对 CURRENT、模型和存储状态。Windows 不执行目录 fsync，本地通过不证明断电恢复能力。
 
