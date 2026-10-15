@@ -1,0 +1,12 @@
+[Unit]
+Description=Archive verified predictor history before trimming Redis retention
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=timepredict
+WorkingDirectory=/opt/timepredict
+EnvironmentFile=/etc/timepredict/service.env
+ExecStart=/opt/timepredict/.venv/bin/timepredict archive-history --archive-dir /var/lib/timepredict/archives --older-than-days 7 --trim-history --trim-events
+UMask=0077
+NoNewPrivileges=true

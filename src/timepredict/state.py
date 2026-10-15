@@ -7,6 +7,8 @@ import json
 from .clock import elapsed
 from .freshness import observation_failure, _proven_before
 
+RETRYABLE_PREDICTIONS = {"model_unavailable", "model_acceptance_expired", "prediction_dependency_unavailable"}
+
 
 # 将 tenant/workflow/agent 编码为稳定业务键。
 def key_of(event):
@@ -26,7 +28,7 @@ def workflow_key(e):
 # 按 event_id 幂等归约事件，维护来源缺口、生命周期、回返关联和待回返状态。
 def reduce_event(original, event, *, copy_state=True):
     state, notices = _reduce_event(original, event, copy_state=copy_state)
-    if any(s.get("bad") or s.get("lost") or "failure_since" in s for s in state["sources"].values()):
+    if state.get("transport_failures") or any(s.get("bad") or s.get("lost") or "failure_since" in s for s in state["sources"].values()):
         for record in state["records"].values():
             if record["status"] not in ("waiting", "returned", "concurrent_conflict"):
                 continue
@@ -83,6 +85,34 @@ def _reduce_event(original, event, *, copy_state=True):
         return old if old and old["utc"] >= admitted else None
 
     stamp = event["stamp"]
+    if event["kind"] in ("transport_gap", "transport_recovered"):
+        failures = state.setdefault("transport_failures", {})
+        if event["kind"] == "transport_gap":
+            failures.setdefault(event["gap_id"], {"failure_since": None, "failure_reason": "invalid_event"})
+        elif event["gap_id"] in failures and event.get("observation_reestablished") is True:
+            failure = failures[event["gap_id"]]
+            if "failure_until" not in failure:
+                failure["failure_until"] = stamp
+        return state, notices
+    if event["kind"] == "source_retired":
+        source = state["sources"].get(event["retired_source"])
+        if (not source or source.get("seq") != event["expected_seq"]
+                or (source.get("manually_retired") and source.get("failure_until"))
+                or event.get("routing_fenced") is not True):
+            return state, notices
+        try:
+            if not _proven_before(source["last"], stamp):
+                return state, notices
+        except ValueError:
+            return state, notices
+        source.setdefault("failure_since", source["last"])
+        source.setdefault("failure_reason", "source_retired")
+        source.update(retired=True, manually_retired=True, failure_until=stamp)
+        for record in list(state["records"].values()):
+            if (record["status"] == "waiting" and
+                    record["out"]["source"]+"/"+record["out"]["boot"] == event["retired_source"]):
+                invalidate(record, "source_retired")
+        return state, notices
     if event["kind"] == "source_lost":
         source = state["sources"].get(event["lost_source"])
         if not source or source.get("retired") or source["last"]["utc"] != event.get("last_seen", source["last"]["utc"]):
@@ -101,6 +131,14 @@ def _reduce_event(original, event, *, copy_state=True):
     # 来源序号断层或进程重启意味着观察不完整，相关等待标签必须失效。
     if "seq" in event:
         source = state["sources"].get(source_key, {"seq": 0, "bad": False})
+        if source.get("manually_retired"):
+            try:
+                before_retirement = _proven_before(stamp, source["failure_until"])
+            except (KeyError, ValueError):
+                before_retirement = False
+            if not before_retirement:
+                source.pop("failure_until", None)
+                source.update(retired=False, bad=True, failure_reason="source_retirement_violated")
         source.setdefault("first", source.get("last", stamp))
         gap = event["seq"] != source["seq"] + 1 or event["kind"] == "gap"
         if gap:
@@ -448,11 +486,18 @@ def _reduce_event(original, event, *, copy_state=True):
 # 仅给仍 waiting 且 pending_prediction 的轮次写预测，防止迟到结果复活旧候选。
 def apply_prediction(state, generation, prediction, status, available_at=None):
     record = state["records"].get(generation)
-    if not record or record["status"] != "waiting" or record["prediction_status"] != "pending_prediction":
+    if (not record or record["status"] != "waiting"
+            or record["prediction_status"] not in {"pending_prediction", *RETRYABLE_PREDICTIONS}):
         return []
     record["prediction"], record["prediction_status"] = prediction, status
     if available_at is not None:
         record["prediction_available_at"] = available_at
+        if status in RETRYABLE_PREDICTIONS:
+            attempts = record.get("prediction_attempts", 0)+1
+            record["prediction_attempts"] = attempts
+            record["prediction_retry_at"] = available_at["utc"]+min(30., 2.**min(attempts, 5))
+        else:
+            record.pop("prediction_retry_at", None)
     state["revision"] += 1
     record["revision"] = state["revision"]
     return [{"action": "update", "tenant": record["tenant"], "key": record["key"], "generation": generation, "revision": state["revision"]}]

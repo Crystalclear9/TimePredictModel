@@ -99,6 +99,7 @@ class Model:
                 raise ValueError("model_checksum_mismatch")
         report = _read_json_object(root / "report.json")
         self.distribution_calibrated = False
+        self.validated_unknown_tools = set()
         self.acceptance_expires_at = 0.0
         if (root / "promotion.json").exists():
             promotion = _read_json_object(root / "promotion.json")
@@ -115,6 +116,8 @@ class Model:
             if decision["decision"] != "approved":
                 raise ValueError("model_acceptance_expired_or_invalid")
             self.distribution_calibrated = True
+            if policy.get("require_tool_holdout") is True:
+                self.validated_unknown_tools = set(report["holdout_tools"])
             self.acceptance_expires_at = evidence["created_at"] + policy["evidence_max_age_seconds"]
         elif require_promoted:
             raise ValueError("model_not_approved")
@@ -194,6 +197,9 @@ class Model:
             row = self.spec.transform(call)
         except UnsupportedInput:
             return None, "unsupported_input"
+        if (self.distribution_calibrated and call["name"] not in self.spec.tools
+                and call["name"] not in self.validated_unknown_tools):
+            return None, "unknown_tool_not_calibrated"
         if call["name"] not in self.spec.tools and self.spec.feature_mode == "legacy_semantic":
             action = call.get("action_family")
             if not action or action not in self.spec.tools:

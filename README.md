@@ -9,6 +9,7 @@
 | 文档 | 内容 |
 |---|---|
 | [数据准备](docs/data.md) | 标签、采集、快照、时间划分和训练前检查 |
+| [故障恢复与容量管理](docs/operations.md) | 来源安全退出、死信恢复、readiness、归档与预算 |
 | [接入契约](docs/integration.md) | API v1、Python 消费端、分布和候选租约 |
 | [验证记录](docs/verification.md) | 实现映射、本地检查、已修复问题和未验证项 |
 
@@ -82,6 +83,8 @@ uv run timepredict serve --window-h 2 --tokens-file /etc/timepredict/tokens.json
 
 ## 快照、训练、验收发布
 
+未知工具默认不能沿用已知工具的校准资格。候选和影子实验仍可测量未知工具；正式服务仅对明确留出并逐工具通过验收的名称放行。启用`require_tool_holdout=true`时，策略须给出`max_unknown_tool_nll`，并检查留出整体及每个工具的样本支持、窗口、分位数和条件窗口；新出现但未验收的名称返回`unknown_tool_not_calibrated`。
+
 ```bash
 uv run timepredict export --output events.jsonl
 uv run timepredict snapshot --events events.jsonl --cutoff UNIX_UTC_SECONDS --output samples.jsonl
@@ -146,6 +149,8 @@ ablation 共享数据、划分和训练预算，保存基线与增强的已知/�
 增量通知重放还会核对读取时的共享状态和观察租约；已闭合的轮次不会因移除通知在下一页而继续作为有效候选。非法通知游标返回422，通知流或共享状态不可用返回503。SDK的输入、内部缓存和返回行相互隔离，修改返回行的分布字段不会改变后续预测。
 
 SDK只为当前候选保留计时信息，版本索引按业务键保留，不逐轮积累。长期接收通知时仍应周期拉取全量快照，恢复遗漏并回收已结束业务键的版本索引。采集事件无法序列化（含过深嵌套）时丢弃该事件、保留序号缺口，后台继续发送后续事件；相关观察按缺口规则降级。
+
+坏消息经死信隔离后继续消费，但观察缺口仍阻断候选。永久下线和缺口恢复使用默认关闭的独立管理员接口；`/internal/ready`以503报告模型、来源或观察不可用。暂时性模型/依赖失败对仍等待轮次退避重试。通知默认保留100000条，落后游标触发SDK清空缓存并重拉快照。历史归档、状态/重训预算及每日维护模板见[故障恢复与容量管理](docs/operations.md)。单JSON状态和全历史回放仍有规模上限，预算超限会拒绝，不会静默删减训练数据。
 
 后续开发的接口入口、扩展约束和验收顺序见[接入文档的开发交接部分](docs/integration.md#后续开发交接)。
 

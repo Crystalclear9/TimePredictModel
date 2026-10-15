@@ -139,6 +139,44 @@ def gate_inputs():
     return report, evidence, policy
 
 
+@pytest.mark.parametrize("fault", ["missing_limit", "huge_nll", "few_samples", "unsupported", "missing_names", "bad_quantile", "unmeasured_name"])
+def test_unknown_tool_gate_requires_quality_and_named_scope(fault):
+    report, evidence, policy = gate_inputs()
+    policy.update(require_tool_holdout=True, max_unknown_tool_nll=2.)
+    report["unknown_tool_test"] = copy.deepcopy(report["test"])
+    report["holdout_tools"] = ["unseen"]
+    report["unknown_tool_metrics"] = {"unseen": copy.deepcopy(report["test"])}
+    assert evaluate_gate(report, evidence, policy, "fixture")["decision"] == "approved"
+    if fault == "missing_limit":
+        del policy["max_unknown_tool_nll"]
+    elif fault == "huge_nll":
+        report["unknown_tool_test"]["nll"] = 1e100
+    elif fault == "few_samples":
+        report["unknown_tool_test"]["windows"]["2.0"]["supported_rows"] = 1
+    elif fault == "unsupported":
+        report["unknown_tool_test"]["windows"]["2.0"]["status"] = "unsupported_tail"
+    elif fault == "missing_names":
+        report["holdout_tools"] = []
+    elif fault == "unmeasured_name":
+        report["holdout_tools"].append("unmeasured")
+    else:
+        report["unknown_tool_test"]["quantile_coverage"]["0.9"]["weighted_actual"] = .1
+    assert evaluate_gate(report, evidence, policy, "fixture")["decision"] == "rejected"
+
+
+def test_actionable_unknown_tools_are_limited_to_validated_names(package):
+    model = Model(package)
+    call = {"name": "heldout", "arguments": {"n": 2}}
+    # An unpromoted candidate can still be measured in shadow/ablation.
+    assert model.predict(call)[1] == "ready"
+    model.distribution_calibrated = True
+    model.acceptance_expires_at = time.time()+3600
+    assert model.predict(call) == (None, "unknown_tool_not_calibrated")
+    model.validated_unknown_tools = {"heldout"}
+    assert model.predict(call)[1] == "ready"
+    assert model.predict({**call, "name": "another"})[1] == "unknown_tool_not_calibrated"
+
+
 @pytest.mark.parametrize("field,value", [("supported_rows", float("inf")), ("supported_rows", "10"),
     ("supported_rows", 10.5), ("effective_sample_size", float("inf")), ("effective_sample_size", 100.),
     ("weighted_actual", 2.), ("weighted_prediction", 2.), ("ipcw_brier", -.1)])

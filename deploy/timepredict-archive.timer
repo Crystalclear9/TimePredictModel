@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily predictor history archival
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=300
+Persistent=true
+Unit=timepredict-archive.service
+
+[Install]
+WantedBy=timers.target

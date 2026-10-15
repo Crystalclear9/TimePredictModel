@@ -6,6 +6,8 @@ __pycache__/
 dist/
 .env
 tokens.json
+admin-tokens.json
+archives/
 service.env
 # 原始采集数据、候选模型、正式模型与运行证据不提交到版本库。
 events.jsonl

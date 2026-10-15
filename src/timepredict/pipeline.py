@@ -101,16 +101,12 @@ async def retrain_once(args):
             cutoff_clock = Clock()
             await asyncio.to_thread(cutoff_clock.refresh)
             cutoff_stamp = cutoff_clock.stamp()
-            cutoff, cursor, events = cutoff_stamp["utc"], "-", []
-            tail = await redis.xrevrange(args.prefix+":history", count=1)
-            boundary = tail[0][0] if tail else "0-0"
-            while True:
-                batch = await redis.xrange(args.prefix+":history", min=cursor, max=boundary, count=1000)
-                if not batch:
-                    break
-                events.extend(json.loads(fields["data"]) for _, fields in batch)
-                cursor = "("+batch[-1][0]
-            rows, excluded = snapshot(events, cutoff, cutoff_stamp=cutoff_stamp)
+            from .retention import read_history
+            cutoff = cutoff_stamp["utc"]
+            events = await read_history(redis, args.prefix, archive_dir=getattr(args, "archive_dir", None),
+                                        max_events=getattr(args, "max_history_events", 100000),
+                                        max_bytes=getattr(args, "max_history_bytes", 128*1024*1024))
+            rows, excluded = await asyncio.to_thread(snapshot, events, cutoff, cutoff_stamp=cutoff_stamp)
             formal = [r for r in rows if r["label_kind"] == "sglang_return_observed"]
             digest = dataset_digest(formal)
             previous_path = output/"last-run.json"

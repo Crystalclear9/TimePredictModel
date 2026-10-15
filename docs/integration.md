@@ -101,6 +101,12 @@ SDK 对输入行和输出行保留独立副本；接入方修改返回的嵌套�
 
 ## unknown、影子和生命周期
 
+正式未知工具默认不可执行；只有明确留出且逐名称通过质量门禁的工具才能使用校准分布。`unknown_tool_not_calibrated`不等于耗时零，也不自动在当前轮次重试。无模型、模型验收过期和临时依赖失败则对仍等待轮次按2至30秒退避重试，ready结果和已闭合记录不被覆盖。
+
+通知流有保留上限。整页返回`resync_required=true`时应立即撤销本地候选、停止应用增量通知并获取新快照。使用`WindowConsumer.notice_page()`或`PredictionClient.poll_notices()`可执行这一流程；不要忽略页面标志仅遍历events。健康接口新增`live/ready/readiness_reasons`，负载均衡应调用`/internal/ready`并处理503，而不是仅检查health是否200。
+
+来源永久退出与transport缺口恢复使用独立管理员凭据，默认关闭，不属于普通租户生命周期权限。前置路由隔离、seq核对、归约后状态核验和归档预算详见[运行维护](operations.md)。
+
 `pending_prediction` 表示尚未计算；`unknown` 附带 `reason`，例如模型不存在、未校准、参数不支持、时钟不可靠、来源丢失或极端尾部。消费方均不主动加载。影子行可含预测统计，但 `in_window=false`，不能参与实际加载。
 
 `observation_gap`、`observation_lost`、`source_restart` 也可能由其他采集入口的故障引起，因为续接不保证回到原入口。故障影响区间未排除时，有效期为零；入口恢复也不自动使区间内的旧调用变为可执行。接入方应遵守 unknown 和版本化移除，不能仅凭 out 所在入口仍存活而继续加载。

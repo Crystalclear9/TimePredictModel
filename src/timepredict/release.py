@@ -80,9 +80,26 @@ def evaluate_gate(report, evidence, policy, version):
     require(report.get("prediction_mode") == "xgboost_aft", "release requires xgboost_aft predictions")
     require(report.get("feature_mode") == "structured" or report.get("embedding_kind") == "sentence_transformers",
             "semantic release requires real Sentence Transformer embeddings")
-    for split in ("validation", "test"):
-        result = section(report, split)
+    if "require_tool_holdout" in policy and type(policy["require_tool_holdout"]) is not bool:
+        require(False, "require_tool_holdout must be boolean")
+    splits = ["validation", "test"]
+    unknown_scopes = []
+    if policy.get("require_tool_holdout") is True:
+        splits.append("unknown_tool_test")
+        limit = policy.get("max_unknown_tool_nll")
+        require(finite(limit), "unknown tool NLL limit required")
+        require(finite(section(report, "unknown_tool_test").get("nll")) and finite(limit)
+                and report["unknown_tool_test"]["nll"] <= limit, "unknown tool NLL exceeds limit")
+        tools = report.get("holdout_tools")
+        require(isinstance(tools, list) and bool(tools) and all(isinstance(t, str) and t for t in tools),
+                "held-out tool names required")
+        if isinstance(tools, list) and all(isinstance(t, str) and t for t in tools):
+            unknown_scopes = [("unknown_tool/"+name, section(report, "unknown_tool_metrics", name)) for name in tools]
+    for split, result in [(name, section(report, name)) for name in splits]+unknown_scopes:
         require(finite(result.get("nll")), split+": invalid likelihood")
+        if split.startswith("unknown_tool/"):
+            require(finite(result.get("nll")) and finite(policy.get("max_unknown_tool_nll"))
+                    and result["nll"] <= policy["max_unknown_tool_nll"], split+": NLL exceeds limit")
         for horizon in policy["horizons"]:
             metric(section(result, "windows").get(str(float(horizon))), f"{split}/H={horizon}", policy["max_window_calibration_error"])
         for q in (0.5, 0.9):
@@ -91,8 +108,6 @@ def evaluate_gate(report, evidence, policy, version):
             for horizon in policy["horizons"]:
                 metric(section(result, "remaining_windows", str(float(age))).get(str(float(horizon))),
                        f"{split}/a={age}/H={horizon}", policy["max_window_calibration_error"])
-    if policy.get("require_tool_holdout"):
-        require(finite(section(report, "unknown_tool_test").get("nll")), "tool holdout experiment missing")
     for horizon in policy["horizons"]:
         name = str(float(horizon))
         measured = section(report, "test", "windows", name).get("ipcw_brier")

@@ -14,7 +14,7 @@ def _proven_before(left, right):
 
 def observation_failure(state, record):
     """A missing ingress event can affect a call sent by any other observer."""
-    for source in state["sources"].values():
+    for source in [*state["sources"].values(), *state.get("transport_failures", {}).values()]:
         if not (source.get("bad") or source.get("lost") or "failure_since" in source):
             continue
         since, until = source.get("failure_since"), source.get("failure_until")

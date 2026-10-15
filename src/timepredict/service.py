@@ -7,6 +7,8 @@ import re
 import secrets
 import time
 import uuid
+import math
+from typing import Literal
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -16,7 +18,8 @@ from redis.exceptions import ResponseError
 from .clock import Clock, elapsed
 from .distribution import LogNormal, UnreliableDistribution
 from .model import Model
-from .state import compact
+from .state import compact, RETRYABLE_PREDICTIONS
+from .events import decode_event
 from .freshness import observation_status, PROCESSOR_TTL
 from .metrics import Histograms
 
@@ -76,6 +79,7 @@ class Worker:
         self.semaphore = asyncio.Semaphore(4)
         self.metrics = {"events": 0, "prediction_errors": 0, "predictions": 0, "redis_errors": 0}
         self.last_error = None
+        self.consumer_error = None
         self.histograms = Histograms()
 
     # 每秒调用时钟刷新；Clock 内部进一步限制 chronyc 查询频率。
@@ -105,9 +109,9 @@ class Worker:
                 self.histograms.observe("prediction_task_queue_seconds", time.monotonic()-started)
                 compute_started = time.monotonic()
                 if self.model:
+                    model = self.model
                     for attempt in range(3):
                         try:
-                            model = self.model  # This generation keeps the model captured at inference start.
                             prediction, status = await asyncio.to_thread(model.predict, record["call"])
                             break
                         except (TimeoutError, ConnectionError):
@@ -165,7 +169,13 @@ class Worker:
                     batches = await redis.xreadgroup("predictor", consumer, {self.store.events: ">"}, count=100, block=500)
                     messages = [item for _, batch in batches for item in batch]
                 for event_id, fields in messages:
-                    event = json.loads(fields["data"])
+                    try:
+                        event = decode_event(fields.get("data"))
+                    except ValueError:
+                        await self.store.quarantine(event_id, fields, self.clock.stamp())
+                        await redis.xack(self.store.events, "predictor", event_id)
+                        self.metrics["quarantined_events"] = self.metrics.get("quarantined_events", 0)+1
+                        continue
                     event["observed_at"] = time.time()
                     try:
                         self.histograms.observe("event_delivery_seconds", elapsed(event["stamp"], self.clock.stamp()))
@@ -174,10 +184,12 @@ class Worker:
                     await self.store.apply(event)
                     await redis.xack(self.store.events, "predictor", event_id)
                     self.metrics["events"] += 1
+                    self.consumer_error = None
                 await asyncio.sleep(0.001)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                self.consumer_error = "event_consumer_failure"
                 self.metrics["redis_errors"] += 1
                 logger.exception("event consumer failure")
                 await asyncio.sleep(1)
@@ -186,6 +198,7 @@ class Worker:
     async def tick(self):
         last_load = 0.
         last_compact = 0.
+        last_refresh = 0.
         while True:
             try:
                 if self.model_dir and time.monotonic() - last_load > 5:
@@ -210,7 +223,9 @@ class Worker:
                     if now["utc"] - min(last_source, last_agent) > self.heartbeat_ttl:
                         await self.store.apply({"kind": "expire", "event_id": uuid.uuid4().hex, "stamp": now,
                                                 "tenant": record["tenant"], "workflow_id": record["workflow_id"], "agent_id": record["agent_id"], "generation": gen})
-                    elif record["prediction_status"] == "pending_prediction" and gen not in self.inflight and len(self.inflight) < 64:
+                    elif ((record["prediction_status"] == "pending_prediction" or
+                           (record["prediction_status"] in RETRYABLE_PREDICTIONS and now["utc"] >= record.get("prediction_retry_at", 0)))
+                          and gen not in self.inflight and len(self.inflight) < 64):
                         self.inflight.add(gen)
                         task = asyncio.create_task(self.predict_one(record))
                         self.prediction_tasks.add(task)
@@ -219,6 +234,11 @@ class Worker:
                 # 在同一 CAS 事务中更新处理器心跳和候选 revision/通知。
                 def refresh(state):
                     state["processor"] = now
+                    state["consumer_error"] = self.consumer_error
+                    state["processor_model"] = {"version": getattr(self.model, "version", None),
+                                                "calibrated": bool(self.model and getattr(self.model, "distribution_calibrated", False)),
+                                                "expires_at": getattr(self.model, "acceptance_expires_at", 0.),
+                                                "shadow": self.shadow}
                     view = window_rows(state, now, self.horizon)
                     notices = []
                     for row in view["records"]:
@@ -229,7 +249,9 @@ class Worker:
                                         "generation": row["generation"], "revision": row["revision"], "H_seconds": self.horizon,
                                         "snapshot_utc": now["utc"], "snapshot_stamp": now, "candidate": row})
                     return state, notices
-                await self.store.mutate(refresh)
+                if time.monotonic()-last_refresh >= .5:
+                    await self.store.mutate(refresh)
+                    last_refresh = time.monotonic()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -279,14 +301,31 @@ class Lifecycle(BaseModel):
     agent_id: str = Field(default="*", min_length=1, max_length=256)
 
 
+class Retirement(BaseModel):
+    source_key: str = Field(min_length=1, max_length=4096)
+    expected_seq: int = Field(gt=0, strict=True)
+    routing_fenced: Literal[True]
+    reason: str = Field(min_length=1, max_length=1024)
+
+
+class Recovery(BaseModel):
+    gap_id: str = Field(min_length=1, max_length=256)
+    observation_reestablished: Literal[True]
+    reason: str = Field(min_length=1, max_length=1024)
+
+
 # 创建认证 API 和生命周期任务；tokens 必须至少包含一个内部令牌到 tenant 的映射。
-def create_app(store, tokens, clock=None, worker=None):
+def create_app(store, tokens, clock=None, worker=None, *, admin_tokens=()):
     if (not isinstance(tokens, dict) or not tokens or any(
             not isinstance(token, str) or not token or not token.isascii()
             or not isinstance(namespace, str) or not namespace
             for token, namespace in tokens.items())):
         raise ValueError("authentication token mapping requires nonempty ASCII tokens and nonempty tenant strings")
     tokens = dict(tokens)  # Do not let later caller mutations change validated tenant bindings.
+    if (not isinstance(admin_tokens, (list, tuple)) or any(not isinstance(t, str) or not t or not t.isascii() for t in admin_tokens)
+            or any(t in tokens for t in admin_tokens)):
+        raise ValueError("admin tokens must be separate nonempty ASCII credentials")
+    admin_tokens = tuple(admin_tokens)
     clock = clock or Clock()
 
     # 随应用启动后台任务，随应用退出取消并等待任务结束。
@@ -317,6 +356,45 @@ def create_app(store, tokens, clock=None, worker=None):
             if secrets.compare_digest(token, expected):
                 return namespace
         raise HTTPException(401, "invalid credential")
+
+    async def admin(authorization: str = Header(default="")):
+        if authorization.startswith("Bearer ") and authorization.isascii():
+            if any(secrets.compare_digest(authorization[7:], t) for t in admin_tokens):
+                return
+        raise HTTPException(403, "operator credential required")
+
+    async def administrative_event(payload):
+        stamp = clock.stamp()
+        error = stamp.get("error")
+        if stamp.get("jumped") or error is None or not math.isfinite(error) or not 0 <= error <= .0025:
+            raise HTTPException(503, "verified administrative clock required")
+        event = {**payload, "stamp": stamp, "event_id": uuid.uuid4().hex}
+        try:
+            await store.redis.xadd(store.events, {"data": json.dumps(event, allow_nan=False)})
+        except Exception as exc:
+            raise HTTPException(503, "event transport unavailable") from exc
+        return {"accepted": True, "event_id": event["event_id"]}
+
+    async def administrative_state():
+        try:
+            return await store.read()
+        except Exception as exc:
+            raise HTTPException(503, "state unavailable") from exc
+
+    @app.post("/internal/admin/retire-source", dependencies=[Depends(admin)])
+    async def retire_source(body: Retirement):
+        state = await administrative_state()
+        source = state["sources"].get(body.source_key)
+        if not source or source.get("seq") != body.expected_seq:
+            raise HTTPException(409, "source sequence changed or unknown")
+        return await administrative_event({"kind": "source_retired", "retired_source": body.source_key,
+                                           **body.model_dump(exclude={"source_key"})})
+
+    @app.post("/internal/admin/recover-transport", dependencies=[Depends(admin)])
+    async def recover_transport(body: Recovery):
+        if body.gap_id not in (await administrative_state()).get("transport_failures", {}):
+            raise HTTPException(404, "unknown gap")
+        return await administrative_event({"kind": "transport_recovered", **body.model_dump()})
 
     # 先读取通知游标，再读取快照，减少并发更新时消费端漏通知的风险。
     @app.get("/internal/contract")
@@ -366,6 +444,10 @@ def create_app(store, tokens, clock=None, worker=None):
             raise HTTPException(422, "invalid stream cursor")
         try:
             messages = await store.redis.xrange(store.notices, min="(" + after, max="+", count=limit)
+            if after != "0-0":
+                first = await store.redis.xrange(store.notices, count=1)
+                if first and tuple(map(int, after.split("-"))) < tuple(map(int, first[0][0].split("-"))):
+                    return {"cursor": after, "events": [], "resync_required": True}
             # Read after the page: a later REMOVE may be outside this page but
             # its closed state must already fence the historical candidate.
             state = await store.read()
@@ -423,18 +505,61 @@ def create_app(store, tokens, clock=None, worker=None):
             await store.redis.ping()
         except Exception as exc:
             raise HTTPException(503, "Redis unavailable") from exc
-        state = await store.read()
+        try:
+            state = await store.read()
+        except Exception as exc:
+            raise HTTPException(503, "state unavailable") from exc
         now = clock.stamp()
         try:
             fresh = elapsed(state["processor"], now) <= PROCESSOR_TTL
         except (ValueError, KeyError):
             fresh = False
-        return {"status": "ok" if fresh else "degraded", "metrics": worker.metrics if worker else {}, "clock": now,
+        model = state.get("processor_model", {})
+        reasons = []
+        if not fresh:
+            reasons.append("processor_stale")
+        if not model.get("version"):
+            reasons.append("model_unavailable")
+        elif not model.get("calibrated") or model.get("shadow"):
+            reasons.append("model_not_actionable")
+        elif now["utc"] > model.get("expires_at", 0.):
+            reasons.append("model_acceptance_expired")
+        if now.get("jumped") or now.get("error") is None or not 0 <= now["error"] <= .0025:
+            reasons.append("clock_unverified")
+        for source in state["sources"].values():
+            if source.get("retired"):
+                continue
+            try:
+                valid = not source.get("bad") and not source.get("lost") and elapsed(source["last"], now) < 30.
+            except ValueError:
+                valid = False
+            if not valid:
+                reasons.append("observer_unavailable")
+                break
+        if not any(not s.get("retired") for s in state["sources"].values()):
+            reasons.append("no_observers")
+        if any("failure_until" not in gap for gap in state.get("transport_failures", {}).values()):
+            reasons.append("transport_gap")
+        if state.get("consumer_error"):
+            reasons.append("event_consumer_failure")
+        return {"status": "degraded" if reasons else "ok", "ready": not reasons, "live": True,
+                "readiness_reasons": reasons, "metrics": worker.metrics if worker else {}, "clock": now,
                 "store_metrics": store.metrics,
                 "processor": state.get("processor"),
                 "latency_seconds": worker.histograms.snapshot() if worker else {},
                 "worker_last_error": worker.last_error if worker else None,
-                "sources": {key: {"bad": value.get("bad", False), "retired": value.get("retired", False), "last": value["last"], "telemetry": value.get("telemetry", {})} for key, value in state["sources"].items()},
-                "model_version": worker.model.version if worker and worker.model else None}
+                "sources": {key: {"bad": value.get("bad", False), "lost": value.get("lost", False),
+                                  "retired": value.get("retired", False), "seq": value.get("seq"), "last": value["last"],
+                                  "failure_until": value.get("failure_until"), "telemetry": value.get("telemetry", {})}
+                            for key, value in state["sources"].items()},
+                "transport_gaps": state.get("transport_failures", {}),
+                "model_version": model.get("version")}
+
+    @app.get("/internal/ready")
+    async def ready(namespace=Depends(tenant)):
+        result = await health(namespace)
+        if not result["ready"]:
+            raise HTTPException(503, {"ready": False, "reasons": result["readiness_reasons"]})
+        return {"ready": True, "model_version": result["model_version"]}
 
     return app

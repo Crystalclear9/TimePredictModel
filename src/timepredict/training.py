@@ -403,6 +403,8 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
               "data_kind": data_kind, "label_kinds": dict(Counter(r.get("label_kind", "observed") for r in rows)),
               "data_digest": dataset_digest(rows), "dataset": describe(rows),
               "unknown_tool_test": assess(unseen) if unseen else {"status": "not_run", "reason": "pass --holdout-tool"},
+              "unknown_tool_metrics": {name: assess([r for r in unseen if r["call"]["name"] == name])
+                                       for name in sorted({r["call"]["name"] for r in unseen})},
               "prediction_mode": "xgboost_aft", "feature_mode": feature_mode, "family_priors": {}, "embedding_kind": spec.embedding_kind,
               "label_provenance_checked": data_kind == "observed",
               "embedding_model": spec.embedding_model, "embedding_dim": spec.embedding_dim,

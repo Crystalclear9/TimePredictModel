@@ -12,17 +12,22 @@ class WindowConsumer:
         self.clock = monotonic
         self.cache = CandidateCache(monotonic)
         self.received = {}
+        self.resync_required = False
 
     def snapshot(self, snapshot, roundtrip_seconds=0.):
         now = self.clock()
         if not math.isfinite(roundtrip_seconds) or roundtrip_seconds < 0:
             raise ValueError("invalid_roundtrip")
         if not self.cache.snapshot(snapshot, roundtrip_seconds):
-            return
+            return False
         self.received = {key: (now, roundtrip_seconds, snapshot["H_seconds"])
                          for key in self.cache.records}
+        self.resync_required = False
+        return True
 
     def notice(self, item, roundtrip_seconds=0.):
+        if self.resync_required:
+            return
         now = self.clock()
         if not math.isfinite(roundtrip_seconds) or roundtrip_seconds < 0:
             raise ValueError("invalid_roundtrip")
@@ -33,6 +38,16 @@ class WindowConsumer:
             self.received[key] = (now, roundtrip_seconds, item["H_seconds"])
         else:
             self.received.pop(key, None)
+
+    def notice_page(self, page, roundtrip_seconds=0.):
+        """A trimmed cursor invalidates local candidates until a fresh snapshot."""
+        if page.get("resync_required"):
+            self.resync_required = True
+            self.cache.records.clear()
+            self.received.clear()
+        else:
+            for item in page["events"]:
+                self.notice(item, roundtrip_seconds)
 
     def candidates(self):
         """Cached mu/sigma are reconditioned locally; expired leases never remain actionable."""
@@ -76,13 +91,30 @@ class PredictionClient:
         self.headers = {"Authorization": "Bearer "+token}
         self.clock = monotonic
         self.consumer = WindowConsumer(monotonic)
+        self.notice_cursor = None
+        self.horizon = None
 
     async def refresh(self, horizon):
         started = self.clock()
         response = await self.http.get(self.url+"/internal/window", params={"H_seconds": horizon}, headers=self.headers)
         response.raise_for_status()
         snapshot = response.json()
-        self.consumer.snapshot(snapshot, self.clock()-started)
+        if self.consumer.snapshot(snapshot, self.clock()-started):
+            self.notice_cursor = snapshot.get("notice_cursor")
+            self.horizon = horizon
+        return self.consumer.candidates()
+
+    async def poll_notices(self):
+        if self.notice_cursor is None:
+            raise ValueError("refresh a snapshot before polling notices")
+        started = self.clock()
+        response = await self.http.get(self.url+"/internal/notices", params={"after": self.notice_cursor}, headers=self.headers)
+        response.raise_for_status()
+        page = response.json()
+        self.consumer.notice_page(page, self.clock()-started)
+        if self.consumer.resync_required:
+            return await self.refresh(self.horizon)
+        self.notice_cursor = page["cursor"]
         return self.consumer.candidates()
 
     def candidates(self):

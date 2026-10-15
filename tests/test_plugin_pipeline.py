@@ -140,7 +140,8 @@ def test_consumer_reconditions_cached_distribution_and_expires_without_network()
     assert consumer.candidates() == []
 
 
-def test_end_to_end_training_publication_and_window(tmp_path):
+@pytest.mark.parametrize("holdout", [False, True])
+def test_end_to_end_training_publication_and_window(tmp_path, holdout):
     # Locally fabricated protocol/acceptance fixtures exercise the gate wiring only.
     events = []
     for i in range(24):
@@ -149,7 +150,14 @@ def test_end_to_end_training_publication_and_window(tmp_path):
                        event("ingress", start+1+duration, request="r2", workflow=wf, latest_tool_ids=["call1"]),
                        event("terminate", start+2+duration, workflow=wf)])
     rows, _ = snapshot(events, 1000)
-    version, report = train(rows, tmp_path/"candidates", rounds=3, threads=1, sigmas=(.5,), data_kind="observed")
+    if holdout:
+        # Change the captured call and its provenance together, before rebuilding labels.
+        for item in events:
+            if int(item["workflow_id"][1:]) % 6 == 0:
+                item["call"] = {**item["call"], "name": "heldout"}
+        rows, _ = snapshot(events, 1000)
+    version, report = train(rows, tmp_path/"candidates", rounds=3, threads=1, sigmas=(.5,), data_kind="observed",
+                            holdout_tools=["heldout"] if holdout else [])
     candidate = tmp_path/"candidates"/version
     assert Model(candidate).predict(rows[0]["call"])[0]["distribution_calibrated"] is False
     with pytest.raises(ValueError, match="not_approved"):
@@ -158,6 +166,8 @@ def test_end_to_end_training_publication_and_window(tmp_path):
               "max_window_calibration_error": 1., "max_quantile_coverage_error": 1., "max_brier_regression": 1.,
               "max_entry_hook_p99_seconds": 1., "max_throughput_drop": 1., "max_prediction_available_p99_seconds": 1.,
               "evidence_max_age_seconds": 3600}
+    if holdout:
+        policy.update(require_tool_holdout=True, max_unknown_tool_nll=100.)
     evidence = {"kind": "server_acceptance", "fixture_only": True, "created_at": time.time(), "model_version": version,
                 "checks": {k: True for k in ("sglang_nonstream", "sglang_stream", "cross_ingress_roundtrip", "clock_bounds", "worker_failover", "prediction_observed")},
                 "metrics": {"throughput_drop_fraction": 0., "entry_hook_p99_seconds": .001,
@@ -173,6 +183,9 @@ def test_end_to_end_training_publication_and_window(tmp_path):
     loaded = Model(tmp_path/"models", require_promoted=True)
     prediction, status = loaded.predict(rows[0]["call"])
     assert status == "ready" and prediction["distribution_calibrated"]
+    if holdout:
+        assert loaded.validated_unknown_tools == {"heldout"} and prediction["unknown_tool"]
+        assert loaded.predict({**rows[0]["call"], "name": "unmeasured"})[1] == "unknown_tool_not_calibrated"
     state, record = waiting()
     apply_prediction(state, record["generation"], prediction, status)
     view = window_rows(state, stamp(2), 10)
