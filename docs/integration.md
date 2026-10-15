@@ -128,6 +128,8 @@ heartbeat/cancel 使用 JSON `{"workflow_id":"w","agent_id":"a"}`；terminate �
 
 外部模块通过API v1或客户端接入；Redis内部状态及reducer由本插件维护。修改API字段、单位、候选判定或特征列/语义文本规则时，应显式升级对应契约，补充兼容或拒绝旧包的测试，重新训练并验收，不能只替换模型或词典中的一个文件。
 
+周期重训会将当前源码/依赖签名与候选报告比较，避免开发更新后静默复用旧训练结果。收据仅作为缓存索引，不能替代候选报告的数据和配置检查；损坏收据保留为`.invalid-last-run-*.json`供排查。候选使用命令返回的VERSION，不依赖自动更新的`best-model`别名。旧AFT特征/动作族读取兼容路径仍保留，已删除的无调用辅助函数不属于API v1接入契约。
+
 开发与验收按以下顺序推进：
 
 1. 运行 `uv run --extra test python scripts/verify_plugin.py`。协议与故障用例提供可复现的本地开发基线；示例的HTTP响应是模拟夹具，未调用真实工具或GPU。

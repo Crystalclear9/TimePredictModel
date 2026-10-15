@@ -10,12 +10,34 @@ import xgboost as xgb
 from scipy.optimize import minimize
 from scipy.special import log_ndtr, ndtr, ndtri
 
-from .clock import elapsed
 from .dataset import validate_rows, describe, validate_label_provenance
-from .features import FeatureSpec, UnsupportedInput, extract
+from .features import FeatureSpec, UnsupportedInput, canonical, extract
 from .model import publish, versions
 from .state import empty_state, reduce_event, workflow_key
 from .actions import ActionFamilies
+
+
+def training_signature(feature_mode):
+    """Bind reuse and reports to preprocessing/training code and runtime versions."""
+    digest = hashlib.sha256()
+    for name in ("training.py", "dataset.py", "features.py", "semantic.py", "actions.py", "model.py",
+                 "state.py", "freshness.py", "clock.py"):
+        digest.update(name.encode()+b"\0")
+        # Normalize checkout line endings so wheel and source use the same contract.
+        digest.update(Path(__file__).with_name(name).read_text(encoding="utf-8").encode())
+    contract = {"code_sha256": digest.hexdigest(), "dependencies": versions(), "feature_mode": feature_mode}
+    if feature_mode != "structured":
+        from importlib.metadata import PackageNotFoundError, version
+        from .semantic import DEFAULT_MODEL, DEFAULT_REVISION
+        try:
+            encoder_version = version("sentence-transformers")
+        except PackageNotFoundError:
+            encoder_version = None
+        import os
+        contract["encoder"] = {"model": DEFAULT_MODEL, "revision": DEFAULT_REVISION,
+                               "package_version": encoder_version,
+                               "test_backend": os.environ.get("TIMEPREDICT_TEST_ENCODER") == "1"}
+    return hashlib.sha256(canonical(contract).encode()).hexdigest()
 
 
 # 生成无需绘图库的简单 SVG 曲线，随候选保存。
@@ -291,15 +313,6 @@ def accuracy_curve(rows, booster, spec, best_iteration, sigma=0.5, time_scale=1.
             "curves": curves, "best_round_accuracy": {t: values[best_iteration] for t, values in curves.items()}}
 
 
-# 按动作族拟合经验 log 时间中位数与尺度；当前训练调用未将其作为主模型。
-def family_priors(rows):
-    grouped = defaultdict(list)
-    for row in rows:
-        grouped[row["call"].get("action_family", row["call"]["name"])].append(math.log(row["lower"]))
-    return {name: {"mu": float(np.median(values)), "sigma": max(float(np.std(values)), 0.25), "rows": len(values)}
-            for name, values in grouped.items()}
-
-
 # 用训练集拟合全局对数正态及全局/按工具 KM 基线，在测试集评价。
 def baseline_reports(train, test):
     # 数值优化带删失样本的全局对数正态负对数似然。
@@ -386,6 +399,7 @@ def train(rows, output, threads=4, rounds=500, sigmas=(0.25, 0.5, 1., 1.5, 2.), 
               "sigma_trials": [{"sigma": s, "validation_nll": score} for score,s,_,_ in candidates],
               "time_scale": time_scale,
               "training_curve": evals_result, "dependencies": versions(), "threads": threads, "seed": 42,
+              "rounds": rounds, "holdout_tools": sorted(held), "training_signature": training_signature(feature_mode),
               "data_kind": data_kind, "label_kinds": dict(Counter(r.get("label_kind", "observed") for r in rows)),
               "data_digest": dataset_digest(rows), "dataset": describe(rows),
               "unknown_tool_test": assess(unseen) if unseen else {"status": "not_run", "reason": "pass --holdout-tool"},
@@ -454,9 +468,7 @@ def load_rows(path):
 
 # 按当前规范化行顺序计算 SHA-256；无限删失上界编码为 null。
 def dataset_digest(rows):
-    from hashlib import sha256
-    from .features import canonical
-    digest = sha256()
+    digest = hashlib.sha256()
     for row in rows:
         digest.update((canonical({**row, "upper": None if row["upper"] is None or math.isinf(row["upper"]) else row["upper"]})+"\n").encode())
     return digest.hexdigest()

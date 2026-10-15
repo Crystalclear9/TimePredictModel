@@ -3,9 +3,9 @@
 import re
 import math
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
-from .semantic import SemanticEncoder, descriptor_text
+from .semantic import SemanticEncoder
 
 STOP = {"the", "a", "an", "to", "of", "for", "with", "and", "tool", "call", "function"}
 SYNONYMS = {"find": "search", "lookup": "search", "query": "search", "retrieve": "search",
@@ -35,8 +35,8 @@ def _descriptor(call):
         args = json.loads(args)
     if not isinstance(args, dict):
         raise ValueError("arguments_not_object")
-    arg_fields = sorted(args) if isinstance(args, dict) else []
-    arg_types = sorted(f"{key}:{type(value).__name__}" for key, value in args.items()) if isinstance(args, dict) else []
+    arg_fields = sorted(args)
+    arg_types = sorted(f"{key}:{type(value).__name__}" for key, value in args.items())
     # Family identity describes an operation contract. Concrete argument
     # values belong in numeric/string-length features, otherwise every unique
     # query becomes a new sparse family and cannot generalize to the test set.
@@ -97,17 +97,14 @@ class ActionFamilies:
     # 检查编码器维度与后端是否符合动作族契约。
     def __post_init__(self):
         if self._encoder is None:
-            try:
-                self._encoder = SemanticEncoder(self.embedding_model, revision=self.embedding_revision)
-                if self._encoder.dim != self.embedding_dim or self._encoder.backend != self.embedding_kind:
-                    raise ValueError("embedding_contract_mismatch")
-            except Exception:
-                raise
+            self._encoder = SemanticEncoder(self.embedding_model, revision=self.embedding_revision)
+            if self._encoder.dim != self.embedding_dim or self._encoder.backend != self.embedding_kind:
+                raise ValueError("embedding_contract_mismatch")
 
     # 顺序聚合训练调用：签名相同直接合并，匹配不足或不明确则新建动作族。
     @classmethod
     def fit(cls, calls):
-        reps, assignments = [], []
+        reps = []
         encoder = SemanticEncoder()
         for call in calls:
             descriptor = _descriptor(call)

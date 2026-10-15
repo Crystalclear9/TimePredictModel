@@ -1,6 +1,5 @@
 # 文件作用：固定 SGLang 版本的采集适配层：观察请求与工具响应，不在 GPU 推理进程中预测模型。
 """Optional SGLang v0.5.19 hooks. No model inference happens here."""
-import asyncio
 import hashlib
 import json
 import logging
@@ -54,10 +53,6 @@ def latest_tool_result(messages):
         else:
             return [], bool(ids)
     return [], bool(ids)
-
-
-def latest_tool_ids(messages):
-    return latest_tool_result(messages)[0]
 
 
 # 累计一轮响应中的工具调用片段，并记录多选项、多工具和不完整输入原因。

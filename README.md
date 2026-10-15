@@ -94,6 +94,8 @@ uv run timepredict train --data samples.jsonl --data-kind observed --feature-mod
 
 训练输出模型、词典、sigma、最佳迭代、依赖版本、数据摘要、覆盖率、窗口/条件窗口校准、经验基线和曲线。训练不更新线上 CURRENT。
 
+候选以返回的VERSION目录定位，不再自动生成`best-model`软链接；正式服务仍只经质量门禁更新CURRENT。报告同时记录训练轮数、留出工具和training_signature，后者绑定相关源码、运行库版本及可选编码器配置，用于重训复用检查。
+
 工作流时间元数据必须覆盖已观察的 OUT/返回/截断边界。时间划分取整个工作流最晚的已知观察时间，不能用偏早的结束时间把未来标签带入训练集；已结束工作流不能冒充行政右删失。
 
 ```bash
@@ -119,7 +121,9 @@ uv run timepredict retrain --output training --feature-mode structured
 uv run timepredict ablation --data samples.jsonl --data-kind observed --output ablation --holdout-tool unseen_tool
 ```
 
-retrain 固定历史流边界及UTC截断，在独立进程训练候选；可续租的 Redis 租约避免重叠训练。数据和配置不变且候选包通过完整性加载检查时才复用；候选丢失或损坏时重新训练。`deploy/timepredict-train.service`、`deploy/timepredict-train.timer` 提供每小时模板。
+retrain 固定历史流边界及UTC截断，在独立进程训练候选；可续租的 Redis 租约避免正常运行时重叠训练。复用要求收据、候选完整性、候选报告中的数据摘要/训练配置及training_signature全部匹配；相关源码或依赖改变也会触发重训。旧报告缺少这些字段时重新训练，既有受支持AFT包仍可独立加载。损坏或非对象last-run.json先保留为`.invalid-last-run-*.json`，再重建收据。`deploy/timepredict-train.service`、`deploy/timepredict-train.timer`提供每小时模板。
+
+取消异步任务不能立即停止已经运行的训练线程，候选写入可能继续；正式CURRENT提交仍受取消和租约检查保护。training_signature用于缓存一致性，不替代特征契约升级、来源认证或发布门禁。
 
 要验收后自动发布，同时提供 --serving-dir、--evidence、--policy；证据需匹配新版本。提交前的验收或文件同步失败不切换 CURRENT；提交后的目录同步错误记录为 `publication_outcome_uncertain`，不能假定仍在使用旧模型。训练收据本身写入失败时也需直接核对 CURRENT。模板默认仅训练候选。
 

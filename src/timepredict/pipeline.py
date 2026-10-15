@@ -10,9 +10,9 @@ import threading
 import uuid
 from pathlib import Path
 
-from .model import Model
+from .model import Model, _flat_name, _read_json_object
 from .clock import Clock
-from .training import dataset_digest, snapshot, split_rows, train
+from .training import dataset_digest, snapshot, split_rows, train, training_signature
 
 
 def atomic_json(path, value):
@@ -114,11 +114,20 @@ async def retrain_once(args):
             formal = [r for r in rows if r["label_kind"] == "sglang_return_observed"]
             digest = dataset_digest(formal)
             previous_path = output/"last-run.json"
-            previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.exists() else {}
+            previous, quarantined_receipt = {}, None
+            if previous_path.exists():
+                try:
+                    previous = _read_json_object(previous_path)
+                except ValueError:
+                    quarantined_receipt = output/f".invalid-last-run-{time.time_ns()}.json"
+                    previous_path.rename(quarantined_receipt)
             settings = {"rounds": args.rounds, "threads": args.threads, "feature_mode": args.feature_mode,
-                        "holdout_tools": args.holdout_tool}
+                        "holdout_tools": sorted(set(args.holdout_tool)),
+                        "training_signature": training_signature(args.feature_mode)}
             result = {"cutoff": cutoff, "excluded": excluded, "rows": len(formal), "data_digest": digest,
                       "settings": settings}
+            if quarantined_receipt is not None:
+                result["quarantined_receipt"] = str(quarantined_receipt)
             if not formal:
                 result.update(status="waiting_for_data", reason="no verified return samples")
                 atomic_json(previous_path, result)
@@ -133,12 +142,19 @@ async def retrain_once(args):
                 result.update(status="waiting_for_data", reason="train/validation require completed returns")
                 atomic_json(previous_path, result)
                 return result
-            reuse = previous.get("data_digest") == digest and previous.get("settings") == settings and previous.get("version")
+            reuse = (previous.get("data_digest") == digest and previous.get("settings") == settings
+                     and _flat_name(previous.get("version")))
             if reuse:
                 try:
                     cached = await asyncio.to_thread(Model, output/"candidates"/previous["version"])
                     if cached.version != previous["version"]:
                         raise ValueError("cached_candidate_version_mismatch")
+                    report = _read_json_object(output/"candidates"/previous["version"]/"report.json")
+                    expected = {"data_digest": digest, "training_signature": settings["training_signature"],
+                                "rounds": args.rounds, "threads": args.threads, "feature_mode": args.feature_mode,
+                                "holdout_tools": settings["holdout_tools"]}
+                    if any(report.get(field) != value for field, value in expected.items()):
+                        raise ValueError("cached_candidate_training_mismatch")
                 except (OSError, ValueError, KeyError, TypeError):
                     reuse = False
             if reuse:

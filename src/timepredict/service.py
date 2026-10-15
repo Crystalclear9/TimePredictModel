@@ -3,7 +3,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
 import re
 import secrets
 import time
@@ -78,7 +77,6 @@ class Worker:
         self.metrics = {"events": 0, "prediction_errors": 0, "predictions": 0, "redis_errors": 0}
         self.last_error = None
         self.histograms = Histograms()
-        self.clock_task = None
 
     # 每秒调用时钟刷新；Clock 内部进一步限制 chronyc 查询频率。
     async def maintain_clock(self):

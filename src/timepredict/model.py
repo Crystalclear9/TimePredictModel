@@ -271,11 +271,4 @@ def publish(root, booster, spec, sigma, best_iteration, report, action_families=
         _fsync_directory(stage)
         os.replace(stage, target)
         _fsync_directory(root)
-        link = root / "best-model"
-        tmp_link = root / (".best-model-" + version)
-        try:
-            tmp_link.symlink_to(target.name, target_is_directory=True)
-            os.replace(tmp_link, link)
-        except OSError:
-            if tmp_link.exists(): tmp_link.unlink()
     return version

@@ -113,8 +113,6 @@ class SemanticEncoder:
     @_synchronized_initialization
     def __init__(self,model_name=DEFAULT_MODEL,cache_folder=None,revision=DEFAULT_REVISION,device="cpu",max_cache=2048):
         cache_key = self._cache_key
-        if getattr(self, "_initialized", False):
-            return
         if model_name!=DEFAULT_MODEL: raise ValueError("unsupported_embedding_model")
         self.model_name,self.revision,self.device=model_name,revision,device
         self.cache_folder=cache_folder or os.environ.get("TIMEPREDICT_EMBEDDING_CACHE")
@@ -124,8 +122,6 @@ class SemanticEncoder:
         try:
             from sentence_transformers import SentenceTransformer
         except Exception as exc:
-            if os.environ.get("TIMEPREDICT_TEST_ENCODER") == "1":
-                self.backend = "test_hashing"; self.model = FrozenSemanticEncoder(384); self.dim = 384; self.version = VERSION; self._cache = OrderedDict(); self._max_cache = max(1, int(max_cache)); self._initialized=True; self._instances[cache_key]=self; return
             raise RuntimeError("sentence_transformers_unavailable") from exc
         try: self.model=SentenceTransformer(model_name,revision=revision,cache_folder=self.cache_folder,device=device,local_files_only=True)
         except TypeError: self.model=SentenceTransformer(model_name,revision=revision,cache_folder=self.cache_folder,device=device,model_kwargs={"local_files_only":True})
