@@ -145,9 +145,13 @@ def test_censoring_requires_correct_source_agent_and_cutoff_clock_evidence():
         validate_label_provenance(broken, data_kind="observed")
 
 
-@pytest.mark.parametrize("bad_value", [float("nan"), "\ud800"])
+@pytest.mark.parametrize("bad_value", [float("nan"), "\ud800", "deeply_nested"])
 def test_bad_json_event_does_not_block_following_events(bad_value):
     from timepredict.publisher import Publisher
+    if bad_value == "deeply_nested":
+        bad_value = []
+        for _ in range(2000):
+            bad_value = [bad_value]
     async def run():
         delivered = []
         class RedisFixture:

@@ -58,7 +58,7 @@ class Publisher:
             try:
                 serialized = json.dumps(event, ensure_ascii=False, allow_nan=False)
                 serialized.encode("utf-8")
-            except (TypeError, ValueError, UnicodeError):
+            except (TypeError, ValueError, UnicodeError, RecursionError):
                 self.dropped += 1
                 self.queue.task_done()
                 logger.exception("timepredict non-JSON event dropped; following sequence exposes the gap")

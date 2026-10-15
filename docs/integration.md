@@ -93,6 +93,8 @@ async with httpx.AsyncClient(timeout=1) as http:
 
 可用 `WindowConsumer.snapshot()`、`WindowConsumer.notice()`、`WindowConsumer.candidates()` 管理本地缓存。旧 revision、已结束 generation 和过期通知不能复活候选。周期全量快照用于恢复遗漏的通知。不要以时间戳或通知到达顺序替代版本检查。
 
+缓存的版本索引按业务键保留；当前候选被替换或移除时立即释放旧计时数据，不要求先调用`candidates()`。同一键的旧轮次remove不能删除新轮次，但匹配当前轮次且比该候选更新的remove仍有效，即使它落后于其他轮次的版本上界。周期全量快照还会回收已结束业务键的版本索引；若不断引入新业务键且只消费通知，索引仍会增长。
+
 SDK 对输入行和输出行保留独立副本；接入方修改返回的嵌套分布或附加调度信息不会污染内部缓存。服务器检查反映读取时的状态，响应之后仍可能发生回返，因此本地版本、通知和过期检查仍须执行。
 
 较新revision的全量快照优先于不同API副本间的微小UTC偏差；同一revision则拒绝相同或更旧的快照时间，防止重复快照延长租约。采集端迟到的更早回返证据可以修正同一generation的训练标签，不创建额外轮次样本。

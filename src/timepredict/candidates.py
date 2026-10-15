@@ -4,14 +4,13 @@ import copy
 import time
 
 
-# 保存可执行候选、各轮版本及全量快照版本下界。
+# 保存可执行候选、业务键版本及全量快照版本下界。
 class CandidateCache:
     # 初始化版本索引；允许注入单调时钟以便确定性验证。
     def __init__(self, monotonic=time.perf_counter):
         self.clock = monotonic
         self.records = {}
         self.floor = 0
-        self.revisions = {}
         self.key_revisions = {}
         self.high_water = 0
         self.snapshot_stamp = None
@@ -38,34 +37,35 @@ class CandidateCache:
         self.snapshot_stamp = stamp if stamp is not None else float("-inf")
         self.high_water = snapshot["revision"]
         self.records.clear()
-        self.revisions.clear()
         self.key_revisions.clear()
         self.floor = snapshot["revision"]
         for row in snapshot["records"]:
-            self.revisions[(row["key"], row["generation"])] = row["revision"]
             self.key_revisions[row["key"]] = row["revision"]
             self._put(row, roundtrip_seconds, received_at)
         return True
 
-    # 按轮次及业务键版本过滤更新；移除通知只删除同一 generation。
+    # 业务键版本过滤更新；移除只作用于同轮且更旧的候选。
     def notice(self, item, roundtrip_seconds=0.):
+        """Return whether cached candidate content changed, never renew a replayed lease."""
         received_at = self.clock()
-        identity = (item["key"], item["generation"])
-        if item["revision"] <= max(self.floor, self.revisions.get(identity, 0)):
-            return
-        self.revisions[identity] = item["revision"]
-        self.high_water = max(self.high_water, item["revision"])
+        revision, key = item["revision"], item["key"]
+        if revision <= self.floor:
+            return False
+        previous = self.key_revisions.get(key, 0)
+        self.key_revisions[key] = max(previous, revision)
+        self.high_water = max(self.high_water, revision)
         if item["action"] == "remove":
             # A newer round's tombstone also fences delayed updates of older rounds.
-            self.key_revisions[item["key"]] = max(self.key_revisions.get(item["key"], 0), item["revision"])
-            current = self.records.get(item["key"])
-            if current and current[0]["generation"] == item["generation"]:
-                del self.records[item["key"]]
-        elif item["action"] == "candidate_update":
-            if item["revision"] <= self.key_revisions.get(item["key"], 0):
-                return
-            self.key_revisions[item["key"]] = item["revision"]
+            # Still apply a matching removal below another round's fence: that
+            # other tombstone deliberately did not remove this cached generation.
+            current = self.records.get(key)
+            if current and current[0]["generation"] == item["generation"] and revision > current[0]["revision"]:
+                del self.records[key]
+                return True
+        elif item["action"] == "candidate_update" and revision > previous:
             self._put(item["candidate"], roundtrip_seconds, received_at)
+            return True
+        return False
 
     # 主动清除过期租约后返回当前候选，即使没有新通知也会失效。
     def candidates(self):

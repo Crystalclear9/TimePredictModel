@@ -19,29 +19,29 @@ class WindowConsumer:
             raise ValueError("invalid_roundtrip")
         if not self.cache.snapshot(snapshot, roundtrip_seconds):
             return
-        self.received = {(r["key"], r["generation"]): (now, roundtrip_seconds, snapshot["H_seconds"])
-                         for r in snapshot["records"]}
+        self.received = {key: (now, roundtrip_seconds, snapshot["H_seconds"])
+                         for key in self.cache.records}
 
     def notice(self, item, roundtrip_seconds=0.):
         now = self.clock()
         if not math.isfinite(roundtrip_seconds) or roundtrip_seconds < 0:
             raise ValueError("invalid_roundtrip")
-        identity = item["key"], item["generation"]
-        before = self.cache.revisions.get(identity, 0)
-        self.cache.notice(item, roundtrip_seconds)
-        current = self.cache.records.get(item["key"])
-        if (self.cache.revisions.get(identity, 0) > before and item["action"] == "candidate_update"
-                and current and current[0]["generation"] == item["generation"] and current[0]["revision"] == item["revision"]):
-            self.received[identity] = (now, roundtrip_seconds, item["H_seconds"])
+        if not self.cache.notice(item, roundtrip_seconds):
+            return
+        key = item["key"]
+        if key in self.cache.records:
+            self.received[key] = (now, roundtrip_seconds, item["H_seconds"])
+        else:
+            self.received.pop(key, None)
 
     def candidates(self):
         """Cached mu/sigma are reconditioned locally; expired leases never remain actionable."""
         result = []
         active = set()
         for cached in self.cache.candidates():
-            identity = cached["key"], cached["generation"]
-            active.add(identity)
-            at, rtt, horizon = self.received[identity]
+            key = cached["key"]
+            active.add(key)
+            at, rtt, horizon = self.received[key]
             passed = max(0., self.clock()-at)+rtt
             row = dict(cached)
             row["age_seconds"] += passed
