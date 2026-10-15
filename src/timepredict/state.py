@@ -5,7 +5,7 @@ import hashlib
 import json
 
 from .clock import elapsed
-from .freshness import observation_failure
+from .freshness import observation_failure, _proven_before
 
 
 # 将 tenant/workflow/agent 编码为稳定业务键。
@@ -101,6 +101,7 @@ def _reduce_event(original, event, *, copy_state=True):
     # 来源序号断层或进程重启意味着观察不完整，相关等待标签必须失效。
     if "seq" in event:
         source = state["sources"].get(source_key, {"seq": 0, "bad": False})
+        source.setdefault("first", source.get("last", stamp))
         gap = event["seq"] != source["seq"] + 1 or event["kind"] == "gap"
         if gap:
             source.setdefault("failure_since", source.get("last") if not source.get("bad") else None)
@@ -114,16 +115,38 @@ def _reduce_event(original, event, *, copy_state=True):
         if "telemetry" in event:
             source["telemetry"] = event["telemetry"]
         state["sources"][source_key] = source
+        def retire(retired_key, retired, replacement_stamp):
+            retired.setdefault("failure_since", retired["last"] if not retired.get("bad") else None)
+            retired.setdefault("failure_reason", "source_restart")
+            retired["failure_until"] = replacement_stamp
+            retired["retired"] = True
+            for record in list(state["records"].values()):
+                if record["status"] == "waiting" and record["out"].get("source", "") + "/" + record["out"].get("boot", "") == retired_key:
+                    invalidate(record, "source_restart")
         for old_key, old in state["sources"].items():
-            if (not source.get("retired") and old_key.startswith(stamp["source"] + "/")
+            if (not source.get("retired") and old["last"].get("source") == stamp["source"]
                     and old_key != source_key and not old.get("retired")):
-                old.setdefault("failure_since", old["last"] if not old.get("bad") else None)
-                old.setdefault("failure_reason", "source_restart")
-                old["failure_until"] = stamp
-                old["retired"] = True
-                for record in list(state["records"].values()):
-                    if record["status"] == "waiting" and record["out"].get("source", "") + "/" + record["out"].get("boot", "") == old_key:
-                        invalidate(record, "source_restart")
+                # An old pending event may first appear after its replacement.
+                # Choose boots by proven clock bounds, not consumer delivery order.
+                try:
+                    older = _proven_before(old["last"], source["first"])
+                except ValueError:
+                    older = False
+                try:
+                    incoming_older = _proven_before(source["last"], old.get("first", old["last"]))
+                except ValueError:
+                    incoming_older = False
+                if older and not incoming_older:
+                    retire(old_key, old, source["first"])
+                elif incoming_older and not older:
+                    retire(source_key, source, old.get("first", old["last"]))
+                else:
+                    # Overlapping or unverified boot intervals cannot establish
+                    # a unique observer. Fence until a proven replacement arrives.
+                    for ambiguous in (old, source):
+                        ambiguous["bad"] = True
+                        ambiguous.setdefault("failure_since", None)
+                        ambiguous.setdefault("failure_reason", "source_identity_conflict")
     if event["kind"] in ("source_heartbeat", "gap"):
         return state, notices
 
@@ -389,8 +412,9 @@ def _reduce_event(original, event, *, copy_state=True):
         if prepared:
             record["lifecycle"] = prepared["lifecycle"] + ["waiting"]
         state["records"][gen] = record
-        if state["sources"].get(source_key, {}).get("bad"):
-            invalidate(record, "observation_gap")
+        observer = state["sources"].get(source_key, {})
+        if observer.get("bad") or observer.get("retired"):
+            invalidate(record, "source_restart" if observer.get("retired") else "observation_gap")
             return state, notices
         if event.get("reason"):
             invalidate(record, event["reason"])

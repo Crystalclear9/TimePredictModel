@@ -14,6 +14,22 @@ def finite_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def validate_workflow_boundaries(row):
+    """Do not let metadata conceal observation times used by temporal splits."""
+    boundaries = [row[field] for field in ("t_out", "t_return", "observation_cutoff")
+                  if row.get(field) is not None]
+    if not boundaries:
+        return
+    start, end = row["workflow_start"], row["workflow_end"]
+    if (not all(finite_number(t) for t in boundaries) or not finite_number(start) or
+            (end is not None and not finite_number(end)) or start > min(boundaries) or
+            (end is not None and end + .005 < max(boundaries))):
+        # A terminal event on a different clock can precede a returned UTC
+        # stamp by up to the existing 5ms clock budget. Splitting still uses
+        # the later observation, never this tolerance to admit a future label.
+        raise ValueError("workflow observation boundary mismatch")
+
+
 # 复制并规范化样本；只接受精确标签 [T,T] 或右删失 [a,null]，拒绝重复 generation。
 def validate_rows(rows):
     if not rows:
@@ -37,6 +53,7 @@ def validate_rows(rows):
             previous = workflows.setdefault(row["workflow"], metadata)
             if previous != metadata:
                 raise ValueError("inconsistent timestamps within a workflow")
+            validate_workflow_boundaries(row)
             lower, upper = row["lower"], row["upper"]
             if upper is None:
                 upper = math.inf
@@ -69,10 +86,13 @@ def validate_label_provenance(rows, *, data_kind, production=False):
     if data_kind == "observed":
         required = "sglang_return_observed"
         for i, row in enumerate(rows, 1):
+            validate_workflow_boundaries(row)
             if row.get("label_kind") != required:
                 raise ValueError(f"sample {i}: observed_requires_sglang_return_observed")
             mode = row.get("association_mode")
             exact = math.isfinite(row["upper"])
+            if not exact and row["workflow_end"] is not None:
+                raise ValueError(f"sample {i}: censoring_requires_open_workflow")
             verified = (mode == "tool_call_id" and row.get("tool_call_id_verified") is True) or (
                 mode in ("serial_fallback", "pending_serial") and row.get("serial_verified") is True)
             if not verified or (exact and mode == "pending_serial"):

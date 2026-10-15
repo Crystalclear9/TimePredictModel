@@ -80,6 +80,16 @@ chronyc CSV字段布局另外对照了[上游输出函数](https://github.com/ml
 
 新增41项模型包和门禁边界检查，模型相关用例使用真实CPU训练/加载，门禁指标使用明确的合成夹具；它们不构成实际服务器验收。原有正式标签训练、门禁拒绝/批准、原子发布、UTF-8包加载及存储故障测试仍通过。摘要检查不是签名认证，不能证明外部提供的训练报告或服务器证据真实。
 
+## 存储恢复、工作流边界和入口重启追加复核
+
+本轮先复现失败，再修复三类问题：
+
+1. Redis的MULTI/EXEC不能撤销运行时类型错误前已执行的命令。history或notices被错误类型占用时，原实现已写入状态/seen，重试反而漏掉历史。现在提交前检查流类型并WATCH两个流键；类型在提交前并发改变时CAS重试，再拒绝错误类型，保持状态和另一个流未写入。修复后重试只提交一次事件和通知。检查使用fakeredis故障注入，不是实际Redis持久化/断电验收，额外往返需目标性能复测。
+2. 工作流元数据可以把已观察返回时间隐藏在偏早的结束时间之后，导致时间隔离失效。现在数据和正式来源校验都检查边界；划分以整个工作流最晚观察时间为准，拒绝同一workflow的矛盾元数据。5ms内终止UTC偏差仍可接受，但不会缩短隔离区间。已结束工作流不能作为正式行政右删失。
+3. 入口ID原先用字符串前缀判断，会把host与host/worker当作同一入口。旧boot首次迟到也会误退役新boot。现在精确比较入口身份，以可证明的时钟区间判定boot顺序；重叠、未知时钟和同一时刻不能判序时保守降级，退役boot不能发出新候选。
+
+新增21项回归检查：4项流类型错误/并发改型及恢复检查，9项工作流边界检查，8项入口身份和boot顺序检查（其中一项遍历三个boot的全部6种到达排列）。旧版已经部分提交的数据不会自动修补，恢复边界见接入文档。
+
 ## 可复现验证
 
 ```bash
@@ -90,9 +100,9 @@ uv run python -m compileall -q src tests scripts deploy examples
 uv lock --check
 ```
 
-当前 245 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
+当前 266 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
 
-补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整245项测试并通过，未将同一套用例重复计数。
+补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整266项测试并通过，未将同一套用例重复计数。
 
 ## 仍需目标环境证据
 

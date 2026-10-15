@@ -101,6 +101,10 @@ SDK 对输入行和输出行保留独立副本；接入方修改返回的嵌套�
 
 `observation_gap`、`observation_lost`、`source_restart` 也可能由其他采集入口的故障引起，因为续接不保证回到原入口。故障影响区间未排除时，有效期为零；入口恢复也不自动使区间内的旧调用变为可执行。接入方应遵守 unknown 和版本化移除，不能仅凭 out 所在入口仍存活而继续加载。
 
+`source_identity_conflict` 表示同一逻辑入口的不同 boot 无法按可信时钟区间排序，相关候选同样不可执行。需要排查重复的入口 ID 或校时状态，并让顺序可证明的替代入口恢复采集。
+
+Redis 的 history/notices 键必须为 Stream。存储层在事务前检查类型，并同时 WATCH 两个流键，防止键类型异常时只写状态、漏写历史或通知。类型错误会阻止提交，事件保持未确认以便修复后重试。修复错误键前应核对既有数据及归档，不能把删除历史流当作通用恢复方法。旧版已经发生的部分写入需从保留的事件流/归档重建，升级不会自动补回缺失历史。此检查增加了Redis往返，需在目标环境重新测量P99和吞吐。
+
 heartbeat/cancel 使用 JSON `{"workflow_id":"w","agent_id":"a"}`；terminate 可以省略 agent_id 结束整个工作流。`accepted=true` 只表示生命周期事件已入流，不是状态已经归约完成。
 
 同一 `(tenant, workflow_id, agent_id)` 下必须遵守串行单工具调用。需要并发 Agent 分支时分配不同的 agent_id；并发多工具轮次不在 v1 预测范围内。

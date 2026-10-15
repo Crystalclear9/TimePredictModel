@@ -2,7 +2,7 @@
 import json
 import time
 
-from redis.exceptions import WatchError
+from redis.exceptions import ResponseError, WatchError
 
 from .state import apply_prediction, empty_state, reduce_event
 
@@ -30,7 +30,14 @@ class RedisStore:
         while True:
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
-                    await pipe.watch(self.state_key)
+                    # EXEC does not roll back SET when a later XADD fails at
+                    # runtime. Check stream types before queuing writes and
+                    # WATCH them so a concurrent type change aborts the CAS.
+                    await pipe.watch(self.state_key, self.history, self.notices)
+                    for stream in (self.history, self.notices):
+                        kind = await pipe.type(stream)
+                        if kind not in ("none", "stream", b"none", b"stream"):
+                            raise ResponseError("stream_key_type_mismatch: " + stream)
                     if self.required_lease:
                         lease_key, token = self.required_lease
                         await pipe.watch(lease_key)

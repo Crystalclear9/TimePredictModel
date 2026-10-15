@@ -30,9 +30,13 @@ JSONL 和模型包使用 UTF-8。输入 JSONL 可带 UTF-8 BOM；非标准 NaN/I
 
 正式样本由 snapshot 生成，携带原始 out/ingress 事件、身份、边界、关联证据和 SHA256。训练会重新核对这些信息。摘要用于一致性检查，数据来源仍必须可信。
 
+工作流开始时间不能晚于已观察边界，结束时间不能明显早于 OUT、返回或 cutoff。同一 workflow 的元数据必须一致。跨时钟终止事件允许现有5ms预算内的UTC偏差，但划分时仍按整个工作流最晚观察时间扩展结束边界，不用该容差放行跨分界标签。
+
 ## 右删失与排除
 
 行政截断可以记录“截至 cutoff 仍未返回”，标签为 `[cutoff-t_out, null]`。它要求来源与 Agent 心跳新鲜，来源/启动身份匹配，观察没有缺口，out 与 cutoff 的时钟误差均不超过 0.0025 秒。普通 OUT 事件或其他来源的心跳不能替代匹配的 source_heartbeat。
+
+正式右删失样本要求 `workflow_end=null`。工作流已经结束的未返回调用属于生命周期排除，不能通过填写 cutoff 改成行政删失。
 
 手动生成删失样本时附加 `--cutoff-clock-error MEASURED_SECONDS`；这个值必须来自实际测量。缺少 cutoff 证据时仍可导出完整返回，等待样本记为 `cutoff_clock_unverified` 并排除。周期重训自动读取本机校时状态。
 

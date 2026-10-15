@@ -66,6 +66,8 @@ uv run python scripts/verify_sglang_patch.py
 
 采集入口使用跨进程重启保持稳定的逻辑 ID，默认由 hostname、HTTP host/port 组成。容器 hostname 会改变时，为每个副本设置独立且稳定的 `TIMEPREDICT_OBSERVER_ID`，同一 ID 不应同时分配给两个存活副本。启动实例以不同 boot 标识区分，旧 boot 的迟到事件不能撤销新 boot。
 
+入口 ID 按完整字符串区分，含 `/` 的 ID 与其前缀不视为同一入口。新旧 boot 按可证明的时钟区间排序，包含旧 boot 首次迟到的情况；区间重叠、时钟未验证或同一时刻无法判序时，相关候选降级 unknown，直到出现顺序可证明的替代入口。
+
 任意入口的采集缺口或失联都可能遗漏另一入口调用的续接。插件按缺口时间区间阻断相关候选和训练标签；替代入口出现后，只放行能够证明在恢复边界之后发出的新调用。旧调用不会自动恢复，缺口前已完成的调用可由时间证据保留。旧版源记录缺少稳定 ID 或缺口边界时保守返回 unknown；迁移应排空调用后切换采集 prefix 或从完整事件历史重建状态。
 
 ```bash
@@ -87,6 +89,8 @@ uv run timepredict train --data samples.jsonl --data-kind observed --feature-mod
 生成右删失样本时，截断时钟也必须有校时证据，并存在匹配来源/启动及 Agent 的新鲜心跳。普通 OUT 事件不能代替来源心跳。手动快照可提供 `--cutoff-clock-error MEASURED_SECONDS`（误差范围0至0.0025秒，必须来自实际测量）；未提供时只保留完整返回，等待样本记为 `cutoff_clock_unverified` 并排除。周期重训自动读取本机校时状态；无校时证据时同样不制造删失标签。
 
 训练输出模型、词典、sigma、最佳迭代、依赖版本、数据摘要、覆盖率、窗口/条件窗口校准、经验基线和曲线。训练不更新线上 CURRENT。
+
+工作流时间元数据必须覆盖已观察的 OUT/返回/截断边界。时间划分取整个工作流最晚的已知观察时间，不能用偏早的结束时间把未来标签带入训练集；已结束工作流不能冒充行政右删失。
 
 ```bash
 uv run timepredict serve --window-h 2 --tokens-file /etc/timepredict/tokens.json --shadow-candidate candidates/VERSION

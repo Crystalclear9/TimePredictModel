@@ -136,3 +136,67 @@ def test_observer_identity_survives_process_restart_and_defaults_are_replica_spe
     monkeypatch.setenv("TIMEPREDICT_OBSERVER_ID", "stable-replica-B")
     install(app, SimpleNamespace(tokenizer_worker_num=1))
     assert captured[-1] == "stable-replica-B"
+
+
+@pytest.mark.parametrize("first,second", [("host/worker", "host"), ("host", "host/worker")])
+def test_observer_ids_are_compared_exactly_not_as_prefixes(first, second):
+    state = empty_state()
+    for item in [event("source_heartbeat", 0, source=first, seq=1),
+                 event("source_heartbeat", 1, source=second, seq=1),
+                 event("source_heartbeat", 2, source=first, seq=2)]:
+        state, _ = reduce_event(state, item)
+    assert not any(source.get("retired") or source.get("bad") for source in state["sources"].values())
+
+
+def test_first_late_event_from_older_boot_cannot_retire_new_boot():
+    # Consumer-group takeover can encounter a new boot before reclaiming an old pending event.
+    state = empty_state()
+    for item in [event("source_heartbeat", 4, source="B", boot="new", seq=1),
+                 event("source_heartbeat", 1, source="B", boot="old", seq=1),
+                 event("out", 5, workflow="new")]:
+        state, _ = reduce_event(state, item)
+    assert state["sources"]["B/old"].get("retired")
+    assert not state["sources"]["B/new"].get("retired")
+    assert predict(state)["new"]["status"] == "ready"
+
+
+def test_boot_order_is_independent_of_transport_order():
+    heartbeats = [event("source_heartbeat", t, source="B", boot=str(t), seq=1) for t in (0, 2, 4)]
+    for order in itertools.permutations(heartbeats):
+        state = empty_state()
+        for item in order:
+            state, _ = reduce_event(state, item)
+        active = [key for key, value in state["sources"].items() if not value.get("retired")]
+        assert active == ["B/4"]
+
+
+@pytest.mark.parametrize("clock_case", ["overlap", "unverified", "same_instant"])
+def test_ambiguous_boot_order_is_fenced_until_proven_replacement(clock_case):
+    first = event("source_heartbeat", 1, source="B", boot="first", seq=1)
+    second = event("source_heartbeat", 1.001, source="B", boot="second", seq=1)
+    if clock_case == "unverified":
+        second["stamp"]["utc"] = second["stamp"]["mono"] = 2
+        first["stamp"]["error"] = None
+    elif clock_case == "same_instant":
+        second["stamp"]["utc"] = second["stamp"]["mono"] = 1
+        first["stamp"]["error"] = second["stamp"]["error"] = 0.
+    state = empty_state()
+    for item in [first, second, event("out", 3, workflow="uncertain")]:
+        state, _ = reduce_event(state, item)
+    assert predict(state)["uncertain"]["status"] == "unknown"
+    if clock_case != "unverified":
+        # A later clock-verified boot starts beyond both ambiguous intervals.
+        for item in [event("source_heartbeat", 4, source="B", boot="replacement", seq=1),
+                     event("out", 5, workflow="new")]:
+            state, _ = reduce_event(state, item)
+        assert predict(state)["new"]["status"] == "ready"
+
+
+def test_retired_boot_cannot_emit_an_actionable_new_out():
+    state = empty_state()
+    for item in [event("source_heartbeat", 1, source="B", boot="old", seq=1),
+                 event("source_heartbeat", 3, source="B", boot="new", seq=1),
+                 event("out", 4, source="B", boot="old", seq=2)]:
+        state, _ = reduce_event(state, item)
+    record = next(iter(state["records"].values()))
+    assert not record["valid"] and record["status"] == "source_restart" and not state["pending"]

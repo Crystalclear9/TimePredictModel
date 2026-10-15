@@ -147,13 +147,25 @@ def snapshot(events, cutoff, heartbeat_ttl=30, cutoff_stamp=None):
 
 # 按工作流开始时间约 70/15/15 划分，跨分界/未结束的早期工作流整体隔离。
 def split_rows(rows):
-    starts = sorted({r["workflow_start"] for r in rows})
+    workflows = {}
+    for row in rows:
+        metadata = (row["workflow_start"], row["workflow_end"])
+        workflow = workflows.setdefault(row["workflow"], {"metadata": metadata, "end": row["workflow_end"]})
+        if workflow["metadata"] != metadata:
+            raise ValueError("inconsistent timestamps within a workflow")
+        if workflow["end"] is not None:
+            # UTC uncertainty may make termination slightly earlier than an
+            # observed return. No sample of that workflow may cross the split.
+            workflow["end"] = max([workflow["end"], *(row[field] for field in ("t_out", "t_return", "observation_cutoff")
+                                  if row.get(field) is not None)])
+    starts = sorted({w["metadata"][0] for w in workflows.values()})
     if len(starts) < 7:
         raise ValueError("need at least 7 distinct workflow start times for temporal validation")
     first, second = starts[int(len(starts) * 0.70)], starts[int(len(starts) * 0.85)]
     groups = {"train": [], "validation": [], "test": [], "quarantine": []}
     for row in rows:
-        start, end = row["workflow_start"], row["workflow_end"]
+        workflow = workflows[row["workflow"]]
+        start, end = workflow["metadata"][0], workflow["end"]
         bucket = "train" if start < first else "validation" if start < second else "test"
         boundary = first if bucket == "train" else second
         if bucket != "test" and (end is None or end >= boundary):
