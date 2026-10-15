@@ -76,6 +76,8 @@ uv run timepredict serve --window-h 2 --tokens-file /etc/timepredict/tokens.json
 
 无模型时返回 unknown，继续采集。跨主机必须有校时证据；时钟不可信时降级。正式服务模板见 `deploy/timepredict.service`。事件经 Redis Streams 顺序、幂等处理，状态、通知和首次历史事件原子提交。生命周期为 prepared→waiting→returned，迟到预测不能复活已闭合记录。
 
+流式发送只把完整的 SSE `data: [DONE]` 行识别为结束；参数中的同名文本不会提前建立 OUT。Agent 示例遇到 length/error/abort 或缺失流结束标记时停止执行工具，并报告取消/终止。
+
 ## 快照、训练、验收发布
 
 ```bash
@@ -133,9 +135,11 @@ ablation 共享数据、划分和训练预算，保存基线与增强的已知/�
 | POST /internal/lifecycle/terminate | 工作流结束 |
 | GET /internal/health | 时钟、来源、模型、开销 |
 
-接口使用内部 Bearer token，按租户隔离。仅使用 ready、in_window、非shadow且未过期的候选；unknown不是零秒。`src/timepredict/client.py` 提供 Python 消费端，`examples/scheduler_client.py` 可接入既有调度器。断网时有效期仍由本地单调时钟执行，本地解析和建立缓存的耗时也计入租约与等待年龄。期望驻留成本从条件分布计算，不能以中位数代替。
+接口使用内部 Bearer token，按租户隔离。仅使用 ready、in_window、非shadow且未过期的候选；unknown不是零秒。`src/timepredict/client.py` 提供 Python 消费端，`examples/scheduler_client.py` 可接入既有调度器。断网时有效期仍由本地单调时钟执行，本地解析、建立缓存和计算整批条件分布的耗时都会消耗租约；SDK输出前再次剔除已过期候选。期望驻留成本从条件分布计算，不能以中位数代替。
 
 增量通知重放还会核对读取时的共享状态和观察租约；已闭合的轮次不会因移除通知在下一页而继续作为有效候选。非法通知游标返回422，通知流或共享状态不可用返回503。SDK的输入、内部缓存和返回行相互隔离，修改返回行的分布字段不会改变后续预测。
+
+后续开发的接口入口、扩展约束和验收顺序见[接入文档的开发交接部分](docs/integration.md#后续开发交接)。
 
 ## 目标环境验收
 

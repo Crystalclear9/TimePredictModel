@@ -90,6 +90,16 @@ chronyc CSV字段布局另外对照了[上游输出函数](https://github.com/ml
 
 新增21项回归检查：4项流类型错误/并发改型及恢复检查，9项工作流边界检查，8项入口身份和boot顺序检查（其中一项遍历三个boot的全部6种到达排列）。旧版已经部分提交的数据不会自动修补，恢复边界见接入文档。
 
+## 原始需求及开发接入追加复核
+
+本轮重新对照原始需求的收敛版本：已有业务ID关联、单工具串行、结构化GBDT/AFT基线、可选联合语义实验、条件剩余时间及外部调度接入。功能范围没有扩展到外部C2公式或KV加载。再次复核仍发现并修复三类问题：
+
+1. ASGI发送层使用子串匹配SSE结束标记，参数文本包含`data: [DONE]`时会提前记录t_out。现在只识别完整结束行，普通参数文本和前后缀文本均有反例测试。
+2. SDK只在条件分布计算前检查租约，慢计算或整批处理会把已经过期的候选返回。现在整批返回前再检查并扣除全部处理耗时；快照和通知两条路径均验证。
+3. Agent示例忽略length/error/abort结束原因，即使响应被截断，已有合法参数仍会执行工具。现在两种流式模式都停止执行并报告取消/终止；正常续接、匹配工具ID和结束生命周期也有模拟HTTP测试。
+
+新增14项检查：2项SSE终止文本、4项慢分布计算与整批过期、8项Agent正常/异常响应。代码修复前10个反例失败，补充正常与通知场景后全部通过。[接入文档](integration.md#后续开发交接)明确了后续开发入口、契约升级约束和目标验收顺序。
+
 ## 可复现验证
 
 ```bash
@@ -100,9 +110,9 @@ uv run python -m compileall -q src tests scripts deploy examples
 uv lock --check
 ```
 
-当前 266 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
+当前 280 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。Agent示例使用httpx.MockTransport检查响应处理、续接和生命周期；没有连接真实SGLang。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
 
-补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整266项测试并通过，未将同一套用例重复计数。
+补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整280项测试并通过，未将同一套用例重复计数。示例测试读取工作区示例文件，插件模块在wheel环境中从site-packages导入。
 
 ## 仍需目标环境证据
 

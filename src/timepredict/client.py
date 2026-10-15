@@ -55,9 +55,18 @@ class WindowConsumer:
                 continue
             if summary["remaining_p50_seconds"] <= horizon and row["valid_for_seconds"] > 0:
                 row.update(summary)
-                result.append(row)
+                result.append((row, at + cached["valid_for_seconds"] - rtt))
         self.received = {k: v for k, v in self.received.items() if k in active}
-        return result
+        # Computing this or later rows consumes the same lease. Check the
+        # whole batch again at return, including rows computed earlier.
+        completed_at = self.clock()
+        current = []
+        for row, expires_at in result:
+            left = expires_at - completed_at
+            if left > 0:
+                row["valid_for_seconds"] = min(row["valid_for_seconds"], left)
+                current.append(row)
+        return current
 
 
 class PredictionClient:

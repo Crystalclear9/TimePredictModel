@@ -59,6 +59,8 @@ TimePredictModel 提供时间信息。外部模块持有 KV 节点、layer、内
 
 SDK 在开始处理每个快照或通知时记录接收时间。建立整批缓存的耗时会继续消耗有效期，并计入 age；处理结束不会重新开始租约。若建缓存已耗尽有效期，候选不会输出。
 
+条件分布计算同样消耗租约。SDK在返回整批结果前再次检查所有候选，包括先计算、随后在处理其他行时已过期的候选；返回的有效期已扣除这段处理耗时。age及分布统计对应本次计算时点，后续密度计算或排队耗时仍需由接入方扣除；实际加载前重新检查当前候选，不能长期保存返回列表而不执行过期和版本检查。客户端使用完整实测往返时间推进age并保守扣减TTL，网络延迟会引入时间估计偏差，需要在目标网络下评价。
+
 ## Python 接入
 
 ```python
@@ -108,6 +110,28 @@ Redis 的 history/notices 键必须为 Stream。存储层在事务前检查类�
 heartbeat/cancel 使用 JSON `{"workflow_id":"w","agent_id":"a"}`；terminate 可以省略 agent_id 结束整个工作流。`accepted=true` 只表示生命周期事件已入流，不是状态已经归约完成。
 
 同一 `(tenant, workflow_id, agent_id)` 下必须遵守串行单工具调用。需要并发 Agent 分支时分配不同的 agent_id；并发多工具轮次不在 v1 预测范围内。
+
+## 后续开发交接
+
+当前交付范围是独立时间预测模块，可在以下边界上继续开发：
+
+| 接入内容 | 使用入口 | 必须保持的约定 |
+|---|---|---|
+| Agent请求与工具执行 | 固定SGLang补丁、[Agent示例](../examples/agent_client.py) | 单工具串行；重试复用request_id；截断响应不执行工具；等待heartbeat、结束terminate |
+| 外部C2/KV调度 | PredictionClient / WindowConsumer、[调度示例](../examples/scheduler_client.py) | 用tenant/workflow/agent/generation映射自有KV对象；处理移除和过期；密度公式、资源预算和加载由接入方实现 |
+| 时间成本 | LogNormal(mu,sigma).summarize(age,horizon) | mu为log秒；按剩余分布计算驻留成本；保留模型版本与时间单位 |
+| 数据与模型迭代 | snapshot / check-data / train / ablation / promote / retrain命令 | 正式事件证据、工作流时间隔离、独立验证/工具留出以及质量门禁 |
+
+外部模块通过API v1或客户端接入；Redis内部状态及reducer由本插件维护。修改API字段、单位、候选判定或特征列/语义文本规则时，应显式升级对应契约，补充兼容或拒绝旧包的测试，重新训练并验收，不能只替换模型或词典中的一个文件。
+
+开发与验收按以下顺序推进：
+
+1. 运行 `uv run --extra test python scripts/verify_plugin.py`。协议与故障用例提供可复现的本地开发基线；示例的HTTP响应是模拟夹具，未调用真实工具或GPU。
+2. 在隔离的真实部署中验证Agent、认证、跨入口关联、时钟、Redis持久化/接管和P99/吞吐。固定版本补丁检查只能验证应用与语法。
+3. 用代表性真实日志训练/留出评价；先运行影子候选，取得对应版本的真实服务器证据，再通过发布门禁切换正式模型。
+4. 接入自有C2/KV映射与加载策略，测量内存、传输、误加载和最终收益。这些结果决定系统是否达到上线条件。
+
+当前本地通过支持接口开发与联调，不代表真实语义泛化、线上校准、GPU运行或KV收益已被证明；未完成项持续记录在[验证文档](verification.md)。
 
 ## 接入方验收
 

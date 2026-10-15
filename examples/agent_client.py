@@ -52,6 +52,8 @@ async def main(args):
                             if "error" in chunk:
                                 raise RuntimeError(chunk["error"])
                             for choice in chunk.get("choices", []):
+                                if choice.get("finish_reason") in ("length", "error", "abort"):
+                                    raise RuntimeError("incomplete response; tool must not execute")
                                 delta = choice.get("delta", {})
                                 content += delta.get("content") or ""
                                 for item in delta.get("tool_calls") or []:
@@ -66,7 +68,10 @@ async def main(args):
                 else:
                     response = await client.post(args.sglang + "/v1/chat/completions", headers=headers, json=payload)
                     response.raise_for_status()
-                    message = response.json()["choices"][0]["message"]
+                    data = response.json()
+                    if any(choice.get("finish_reason") in ("length", "error", "abort") for choice in data.get("choices", [])):
+                        raise RuntimeError("incomplete response; tool must not execute")
+                    message = data["choices"][0]["message"]
                 calls = message.get("tool_calls") or []
                 if not calls:
                     print(message.get("content", ""))

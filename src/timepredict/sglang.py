@@ -209,7 +209,8 @@ class ObservationMiddleware:
                 streaming = any(k.lower() == b"content-type" and b"text/event-stream" in v for k, v in message.get("headers", []))
             capture = state.get("timepredict_capture")
             terminal = success and capture and message["type"] == "http.response.body" and (
-                b"data: [DONE]" in message.get("body", b"") if streaming else not message.get("more_body", False))
+                any(line == b"data: [DONE]" for line in message.get("body", b"").splitlines())
+                if streaming else not message.get("more_body", False))
             stamp = self.publisher.clock.stamp() if terminal else None
             if terminal and capture and not state.get("timepredict_prepared"):
                 prepared = capture.payload()

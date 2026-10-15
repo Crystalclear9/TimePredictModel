@@ -74,3 +74,31 @@ def test_client_processing_cannot_extend_candidate_lease(monkeypatch, mode):
                          "H_seconds": 2., "candidate": rows[0]})
         assert consumer.candidates()[0]["age_seconds"] == pytest.approx(2.6)
         assert consumer.candidates()[0]["valid_for_seconds"] == pytest.approx(.4)
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("mode", ["snapshot", "notice"])
+def test_distribution_computation_consumes_lease_before_returning_batch(monkeypatch, count, mode):
+    from timepredict.distribution import LogNormal
+    now = [0.]
+    consumer = WindowConsumer(lambda: now[0])
+    rows = [{"key": f"k{i}", "generation": f"g{i}", "revision": 10+i, "status": "ready", "in_window": True,
+             "age_seconds": 2., "valid_for_seconds": 1.,
+             "distribution": {"mu": math.log(3), "sigma": .5, "distribution_calibrated": True}} for i in range(count)]
+    if mode == "snapshot":
+        consumer.snapshot({"revision": 10+count, "snapshot_utc": 100., "H_seconds": 2., "records": rows})
+    else:
+        for row in rows:
+            consumer.notice({"action": "candidate_update", "key": row["key"], "generation": row["generation"],
+                             "revision": row["revision"], "H_seconds": 2., "candidate": row})
+    summarize = LogNormal.summarize
+    def slow_summary(self, *args, **kwargs):
+        value = summarize(self, *args, **kwargs)
+        now[0] += .6
+        return value
+    monkeypatch.setattr(LogNormal, "summarize", slow_summary)
+    result = consumer.candidates()
+    if count == 1:
+        assert result[0]["valid_for_seconds"] == pytest.approx(.4)
+    else:
+        assert now[0] == 1.2 and result == []
