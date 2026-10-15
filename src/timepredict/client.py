@@ -14,15 +14,16 @@ class WindowConsumer:
         self.received = {}
 
     def snapshot(self, snapshot, roundtrip_seconds=0.):
+        now = self.clock()
         if not math.isfinite(roundtrip_seconds) or roundtrip_seconds < 0:
             raise ValueError("invalid_roundtrip")
         if not self.cache.snapshot(snapshot, roundtrip_seconds):
             return
-        now = self.clock()
         self.received = {(r["key"], r["generation"]): (now, roundtrip_seconds, snapshot["H_seconds"])
                          for r in snapshot["records"]}
 
     def notice(self, item, roundtrip_seconds=0.):
+        now = self.clock()
         if not math.isfinite(roundtrip_seconds) or roundtrip_seconds < 0:
             raise ValueError("invalid_roundtrip")
         identity = item["key"], item["generation"]
@@ -31,7 +32,7 @@ class WindowConsumer:
         current = self.cache.records.get(item["key"])
         if (self.cache.revisions.get(identity, 0) > before and item["action"] == "candidate_update"
                 and current and current[0]["generation"] == item["generation"] and current[0]["revision"] == item["revision"]):
-            self.received[identity] = (self.clock(), roundtrip_seconds, item["H_seconds"])
+            self.received[identity] = (now, roundtrip_seconds, item["H_seconds"])
 
     def candidates(self):
         """Cached mu/sigma are reconditioned locally; expired leases never remain actionable."""

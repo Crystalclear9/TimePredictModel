@@ -41,6 +41,14 @@
 
 文档统一为 README 和 docs 下的数据、接入、验证三份；旧实验产物、重复审计结果、构建文件及缓存不作为交付材料。运行环境 `.venv/` 保留且不提交。历史实验代码可从 Git 历史取回。
 
+## 接口边界追加复核
+
+- 启动时拒绝 null/空租户、错误映射类型和非法令牌，防止空租户落入全量查询分支；保存验证后的映射副本，避免调用方后续修改改变隔离绑定。
+- 非 ASCII Authorization 曾触发字符串常量时间比较异常并返回 500，现在统一返回 401，合法凭据仍可正常访问。
+- 快照和通知处理中本地耗时曾被遗漏，批量建缓存会延长候选有效期。现在从消费入口记录单调时刻，缓存期限与 age 都计入处理耗时。
+
+新增 12 项启动配置、HTTP 鉴权、租户隔离和慢消费者故障注入检查，覆盖已复现问题及配置绑定不可变性等回归场景。
+
 ## 可复现验证
 
 ```bash
@@ -51,7 +59,7 @@ uv run python -m compileall -q src tests scripts deploy examples
 uv lock --check
 ```
 
-当前 154 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。
+当前 166 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。
 
 补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist 和清理后的包入口。
 

@@ -8,6 +8,8 @@ TimePredictModel 提供时间信息。外部模块持有 KV 节点、layer、内
 
 请求 `GET /internal/window?H_seconds=2`，携带 `Authorization: Bearer INTERNAL_TOKEN`。所有时间为秒，`snapshot_utc` 是 Unix UTC。下面是格式示意，数值不是测量结果：
 
+服务启动时验证令牌映射：键必须是非空 ASCII 字符串，租户值必须是非空字符串。null 或错误类型不会被解释为“全部租户”。服务保存已验证映射的副本，修改调用方原字典不会更改已有服务的绑定。非 ASCII 认证头返回 401。
+
 ```json
 {
   "api_version": 1,
@@ -54,6 +56,8 @@ TimePredictModel 提供时间信息。外部模块持有 KV 节点、layer、内
 入窗规则为剩余 P50 ≤ H；`prob_return_within_H` 是估计概率，不保证实际回返。`expected_capped_remaining_seconds` 为 `E[min(R,H) | T>age]`，适合有 H 秒驻留上限的成本模型；其他上限应从缓存分布重新计算。不能以 P50 替代期望成本。
 
 消费方在响应抵达时扣除实测往返时间（保守扣减），以本地单调时钟倒计时。到期立即撤销候选，即使没有通知、网络断开或服务不可用。`expires_at_utc` 供诊断，不能在没有校时证据时仅依赖它。
+
+SDK 在开始处理每个快照或通知时记录接收时间。建立整批缓存的耗时会继续消耗有效期，并计入 age；处理结束不会重新开始租约。若建缓存已耗尽有效期，候选不会输出。
 
 ## Python 接入
 

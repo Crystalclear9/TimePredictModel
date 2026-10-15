@@ -276,8 +276,12 @@ class Lifecycle(BaseModel):
 
 # 创建认证 API 和生命周期任务；tokens 必须至少包含一个内部令牌到 tenant 的映射。
 def create_app(store, tokens, clock=None, worker=None):
-    if not tokens:
-        raise ValueError("at least one authentication token is required")
+    if (not isinstance(tokens, dict) or not tokens or any(
+            not isinstance(token, str) or not token or not token.isascii()
+            or not isinstance(namespace, str) or not namespace
+            for token, namespace in tokens.items())):
+        raise ValueError("authentication token mapping requires nonempty ASCII tokens and nonempty tenant strings")
+    tokens = dict(tokens)  # Do not let later caller mutations change validated tenant bindings.
     clock = clock or Clock()
 
     # 随应用启动后台任务，随应用退出取消并等待任务结束。
@@ -301,9 +305,11 @@ def create_app(store, tokens, clock=None, worker=None):
 
     # 常量时间比较 Bearer 令牌并返回绑定的租户命名空间。
     async def tenant(authorization: str = Header(default="")):
+        if not authorization.startswith("Bearer ") or not authorization.isascii():
+            raise HTTPException(401, "invalid credential")
         token = authorization.removeprefix("Bearer ")
         for expected, namespace in tokens.items():
-            if secrets.compare_digest(token, expected) and authorization.startswith("Bearer "):
+            if secrets.compare_digest(token, expected):
                 return namespace
         raise HTTPException(401, "invalid credential")
 

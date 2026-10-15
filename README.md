@@ -60,7 +60,7 @@ uv run python scripts/verify_sglang_patch.py
 2. 配置持久化 Redis，设置 `TIMEPREDICT_REDIS_URL`、可选 `TIMEPREDICT_PREFIX`。
 3. SGLang 启用 API key，每副本一个 HTTP/tokenizer worker，可多副本。Agent 携带 X-Workflow-ID、X-Agent-ID、X-Request-ID；重试复用 request_id。
 4. Agent 等待期间每5秒 heartbeat，结束上报 terminate，取消上报 cancel。见 `examples/agent_client.py`。
-5. 内部 tokens.json 为 `{"internal-token":"sha256-of-sglang-api-key"}`。租户命名空间来自已认证 SGLang key 的摘要。令牌文件不要提交仓库。
+5. 内部 tokens.json 为 `{"internal-token":"sha256-of-sglang-api-key"}`，必须是非空 JSON 对象，键为非空 ASCII 令牌，值为非空租户字符串；null 租户会在启动时被拒绝。租户命名空间来自已认证 SGLang key 的摘要。令牌文件不要提交仓库。
 
 ```bash
 uv run timepredict serve --window-h 2 --tokens-file /etc/timepredict/tokens.json --models models
@@ -119,7 +119,7 @@ ablation 共享数据、划分和训练预算，保存基线与增强的已知/�
 | POST /internal/lifecycle/terminate | 工作流结束 |
 | GET /internal/health | 时钟、来源、模型、开销 |
 
-接口使用内部 Bearer token，按租户隔离。仅使用 ready、in_window、非shadow且未过期的候选；unknown不是零秒。`src/timepredict/client.py` 提供 Python 消费端，`examples/scheduler_client.py` 可接入既有调度器。断网时有效期仍由本地单调时钟执行。期望驻留成本从条件分布计算，不能以中位数代替。
+接口使用内部 Bearer token，按租户隔离。仅使用 ready、in_window、非shadow且未过期的候选；unknown不是零秒。`src/timepredict/client.py` 提供 Python 消费端，`examples/scheduler_client.py` 可接入既有调度器。断网时有效期仍由本地单调时钟执行，本地解析和建立缓存的耗时也计入租约与等待年龄。期望驻留成本从条件分布计算，不能以中位数代替。
 
 ## 目标环境验收
 

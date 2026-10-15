@@ -16,15 +16,16 @@ class CandidateCache:
         self.snapshot_stamp = None
 
     # 从有效期扣除网络往返时间；仅缓存 ready 且已入窗的记录。
-    def _put(self, row, roundtrip_seconds):
+    def _put(self, row, roundtrip_seconds, received_at):
         ttl = max(0., row.get("valid_for_seconds", 0.)-roundtrip_seconds)
         if row.get("status") != "ready" or not row.get("in_window") or ttl <= 0:
             self.records.pop(row["key"], None)
         else:
-            self.records[row["key"]] = (dict(row), self.clock()+ttl)
+            self.records[row["key"]] = (dict(row), received_at+ttl)
 
     # 接受足够新的全量快照，重建缓存并设置旧通知过滤下界。
     def snapshot(self, snapshot, roundtrip_seconds=0.):
+        received_at = self.clock()
         if snapshot["revision"] < self.high_water:
             return False
         stamp = snapshot.get("snapshot_utc")
@@ -42,11 +43,12 @@ class CandidateCache:
         for row in snapshot["records"]:
             self.revisions[(row["key"], row["generation"])] = row["revision"]
             self.key_revisions[row["key"]] = row["revision"]
-            self._put(row, roundtrip_seconds)
+            self._put(row, roundtrip_seconds, received_at)
         return True
 
     # 按轮次及业务键版本过滤更新；移除通知只删除同一 generation。
     def notice(self, item, roundtrip_seconds=0.):
+        received_at = self.clock()
         identity = (item["key"], item["generation"])
         if item["revision"] <= max(self.floor, self.revisions.get(identity, 0)):
             return
@@ -62,7 +64,7 @@ class CandidateCache:
             if item["revision"] <= self.key_revisions.get(item["key"], 0):
                 return
             self.key_revisions[item["key"]] = item["revision"]
-            self._put(item["candidate"], roundtrip_seconds)
+            self._put(item["candidate"], roundtrip_seconds, received_at)
 
     # 主动清除过期租约后返回当前候选，即使没有新通知也会失效。
     def candidates(self):
