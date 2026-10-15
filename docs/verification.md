@@ -26,7 +26,7 @@
 | 目标容量探针 | deploy/benchmark_scale.py | 模拟状态进入 ready 后运行分布计算；临时 Redis prefix 清理 |
 | 外部 C2/KV 接入 | client.py / examples | [API 契约](integration.md) 提供时间分布和驻留成本输入 |
 
-## 本轮修复
+## 采集和重训修复
 
 1. SSE 中相同的合法名称片段被错误去重，工具名与定义关联会出错。现在按协议逐片拼接。
 2. 普通 OUT 被当作来源存活依据时，snapshot 会导出缺少 source_heartbeat 的删失样本，随后导致正式训练拒绝整批数据。现在缺少匹配心跳时单独排除，并检查心跳 TTL 有限。
@@ -49,6 +49,14 @@
 
 新增 12 项启动配置、HTTP 鉴权、租户隔离和慢消费者故障注入检查，覆盖已复现问题及配置绑定不可变性等回归场景。
 
+## 通知恢复与缓存所有权复核
+
+- 分页重放曾在共享状态已返回/取消后，继续提供尚未过期的旧候选。现在读取通知页后核对当前 generation、等待/预测状态和观察租约，关闭或失效时降级，不等待下一页 remove。
+- 通知游标现在限制为规范 ASCII 数字及有效数值范围，异常输入返回422；通知流或状态读取中断返回503。
+- 候选嵌套分布曾被输入行、返回行与内部缓存共享。现在读写缓存都复制完整候选，接入方修改外部对象不会改变后续结果。
+
+新增15项分页关闭/取消、处理器失效、游标合法和异常边界、Redis读取故障及输入/输出别名检查；原有正常通知的时间推进和租户隔离检查保留。
+
 ## 可复现验证
 
 ```bash
@@ -59,7 +67,7 @@ uv run python -m compileall -q src tests scripts deploy examples
 uv lock --check
 ```
 
-当前 166 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。
+当前 181 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。容量探针的本地测试也使用 fakeredis，并模拟内存查询。
 
 补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist 和清理后的包入口。
 

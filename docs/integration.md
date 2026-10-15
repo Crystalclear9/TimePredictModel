@@ -83,11 +83,15 @@ async with httpx.AsyncClient(timeout=1) as http:
 
 先取得快照及 `notice_cursor`，再读取 `/internal/notices?after=CURSOR`。响应游标推进到最后读取事件，即使事件属于其他租户；只返回令牌所属租户内容。
 
+游标使用服务返回的标准 ASCII 数字格式；非法或越界游标返回422，通知流或共享状态读取失败返回503。服务器在读取通知页后核对共享状态：轮次已返回、取消、被替换或清理时，历史候选降级为 `unknown/round_no_longer_pending`、`in_window=false`、有效期为零，即使对应 remove 尚在下一页。当前观察租约失效时也会降级。
+
 - `candidate_update`：附带候选、`generation`、`revision`、`H_seconds`。
 - `remove`：关闭、取消、观察失败等状态移除该 generation 的候选。
 - `update`：内部状态变更提示；当前窗口是否可用仍由全量快照或后续 `candidate_update` 确认。
 
 可用 `WindowConsumer.snapshot()`、`WindowConsumer.notice()`、`WindowConsumer.candidates()` 管理本地缓存。旧 revision、已结束 generation 和过期通知不能复活候选。周期全量快照用于恢复遗漏的通知。不要以时间戳或通知到达顺序替代版本检查。
+
+SDK 对输入行和输出行保留独立副本；接入方修改返回的嵌套分布或附加调度信息不会污染内部缓存。服务器检查反映读取时的状态，响应之后仍可能发生回返，因此本地版本、通知和过期检查仍须执行。
 
 较新revision的全量快照优先于不同API副本间的微小UTC偏差；同一revision则拒绝相同或更旧的快照时间，防止重复快照延长租约。采集端迟到的更早回返证据可以修正同一generation的训练标签，不创建额外轮次样本。
 

@@ -228,8 +228,15 @@ def test_http_contract_authentication_and_tenant_isolation():
             assert (await client.get("/internal/window", params={"H_seconds": -1}, headers={"Authorization": "Bearer secret"})).status_code == 422
             result = await client.post("/internal/lifecycle/heartbeat", json={"workflow_id": "w", "agent_id": "a"}, headers={"Authorization": "Bearer secret"})
             assert result.json()["accepted"]
-            notice = {"action": "candidate_update", "tenant": "tenant", "key": "k", "generation": "g", "revision": 10,
-                      "snapshot_utc": 1., "snapshot_stamp": stamp(1), "H_seconds": 2., "candidate": {"status": "ready", "key": "k", "generation": "g",
+            record = next(iter((await store.read())["records"].values()))
+            await store.prediction(record["generation"], {"mu": math.log(3), "sigma": .5, "model_version": "fixture",
+                                                        "distribution_calibrated": True}, "ready")
+            def processor(state):
+                state["processor"] = stamp(2)
+                return state, []
+            await store.mutate(processor)
+            notice = {"action": "candidate_update", "tenant": "tenant", "key": record["key"], "generation": record["generation"], "revision": 10,
+                      "snapshot_utc": 1., "snapshot_stamp": stamp(1), "H_seconds": 2., "candidate": {"status": "ready", "key": record["key"], "generation": record["generation"],
                       "revision": 10, "age_seconds": 1., "expires_at_utc": 3., "valid_for_seconds": 2., "in_window": False,
                       "distribution": {"mu": math.log(3), "sigma": .5, "distribution_calibrated": True}}}
             await redis.xadd(store.notices, {"data": json.dumps(notice)})

@@ -1,5 +1,6 @@
 # 文件作用：候选消费端缓存：利用 generation/revision 拒绝旧通知，用单调时间执行本地过期。
 """C2-side lease cache: expiry is enforced even when no new messages arrive."""
+import copy
 import time
 
 
@@ -21,7 +22,7 @@ class CandidateCache:
         if row.get("status") != "ready" or not row.get("in_window") or ttl <= 0:
             self.records.pop(row["key"], None)
         else:
-            self.records[row["key"]] = (dict(row), received_at+ttl)
+            self.records[row["key"]] = (copy.deepcopy(row), received_at+ttl)
 
     # 接受足够新的全量快照，重建缓存并设置旧通知过滤下界。
     def snapshot(self, snapshot, roundtrip_seconds=0.):
@@ -72,4 +73,4 @@ class CandidateCache:
         for key, (_, expires) in list(self.records.items()):
             if expires <= now:
                 del self.records[key]
-        return [row for row, _ in self.records.values()]
+        return [copy.deepcopy(row) for row, _ in self.records.values()]

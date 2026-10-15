@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import math
+import re
 import secrets
 import time
 import uuid
@@ -355,9 +356,17 @@ def create_app(store, tokens, clock=None, worker=None):
     # 读取游标后的通知并过滤租户；历史候选租约过期时降级而不重新激活。
     @app.get("/internal/notices")
     async def notices(after: str = "0-0", limit: int = Query(default=100, ge=1, le=1000), namespace=Depends(tenant)):
-        if not __import__("re").fullmatch(r"\d+-\d+", after):
+        component = r"(?:0|[1-9][0-9]{0,19})"
+        if (not re.fullmatch(component + "-" + component, after)
+                or any(int(part) > 2**64-1 for part in after.split("-"))):
             raise HTTPException(422, "invalid stream cursor")
-        messages = await store.redis.xrange(store.notices, min="(" + after, max="+", count=limit)
+        try:
+            messages = await store.redis.xrange(store.notices, min="(" + after, max="+", count=limit)
+            # Read after the page: a later REMOVE may be outside this page but
+            # its closed state must already fence the historical candidate.
+            state = await store.read()
+        except Exception as exc:
+            raise HTTPException(503, "notification state unavailable") from exc
         now = clock.stamp()
         events = []
         for ident, fields in messages:
@@ -373,6 +382,17 @@ def create_app(store, tokens, clock=None, worker=None):
                     failure = "expired_notice" if left <= 0 else None
                 except (KeyError, ValueError) as exc:
                     left, failure = 0., "notice_clock_unverified" if isinstance(exc, KeyError) else str(exc)
+                if not failure:
+                    current = state["records"].get(item["generation"])
+                    if (not current or current["key"] != item["key"] or current["tenant"] != namespace
+                            or current["status"] != "waiting" or not current["valid"]
+                            or state["pending"].get(item["key"]) != item["generation"]):
+                        failure = "round_no_longer_pending"
+                    elif current["prediction_status"] != "ready":
+                        failure = "prediction_no_longer_ready"
+                    else:
+                        failure, current_ttl = observation_status(state, current, now)
+                        left = min(left, current_ttl)
                 if failure:
                     candidate.update(status="unknown", reason=failure, in_window=False, valid_for_seconds=0.)
                 else:

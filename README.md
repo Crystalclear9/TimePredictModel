@@ -121,6 +121,8 @@ ablation 共享数据、划分和训练预算，保存基线与增强的已知/�
 
 接口使用内部 Bearer token，按租户隔离。仅使用 ready、in_window、非shadow且未过期的候选；unknown不是零秒。`src/timepredict/client.py` 提供 Python 消费端，`examples/scheduler_client.py` 可接入既有调度器。断网时有效期仍由本地单调时钟执行，本地解析和建立缓存的耗时也计入租约与等待年龄。期望驻留成本从条件分布计算，不能以中位数代替。
 
+增量通知重放还会核对读取时的共享状态和观察租约；已闭合的轮次不会因移除通知在下一页而继续作为有效候选。非法通知游标返回422，通知流或共享状态不可用返回503。SDK的输入、内部缓存和返回行相互隔离，修改返回行的分布字段不会改变后续预测。
+
 ## 目标环境验收
 
 `deploy/benchmark_server.py` 比较固定工具负载下采集前后的服务开销并验证流式/非流式与跨入口关联；`deploy/verify_failover.py` 在专用部署执行操作者指定的停止命令并检查接管；`deploy/benchmark_scale.py` 在独立 Redis prefix 下测量状态事务、有效候选分布计算、内存及离线评估开销。各脚本使用 `--help` 查看参数。
