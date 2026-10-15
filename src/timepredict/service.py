@@ -144,9 +144,11 @@ class Worker:
         finally:
             self.inflight.discard(generation)
 
-    # 消费 Redis 组消息并接管超时未确认消息；状态/历史成功提交后才 XACK。
+    # 优先接管全部未确认消息，再读取新消息；状态/历史成功提交后才 XACK。
     async def consume(self):
         redis = self.store.redis
+        if not self.store.required_lease:
+            raise RuntimeError("event consumer requires an elected worker lease")
         try:
             await redis.xgroup_create(self.store.events, "predictor", id="0", mkstream=True)
         except ResponseError as exc:
@@ -155,7 +157,11 @@ class Worker:
         consumer = uuid.uuid4().hex
         while True:
             try:
-                claimed = await redis.xautoclaim(self.store.events, "predictor", consumer, 10000, "0-0", count=100)
+                # The elected worker is the only authorized state writer.
+                # Drain even freshly pending entries before reading newer IDs;
+                # waiting for an idle timeout creates false source sequence gaps
+                # during a fast handover. Every apply is fenced by the lease CAS.
+                claimed = await redis.xautoclaim(self.store.events, "predictor", consumer, 0, "0-0", count=100)
                 messages = claimed[1]
                 if not messages:
                     batches = await redis.xreadgroup("predictor", consumer, {self.store.events: ">"}, count=100, block=500)

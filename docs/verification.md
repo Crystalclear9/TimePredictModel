@@ -100,6 +100,14 @@ chronyc CSV字段布局另外对照了[上游输出函数](https://github.com/ml
 
 新增14项检查：2项SSE终止文本、4项慢分布计算与整批过期、8项Agent正常/异常响应。代码修复前10个反例失败，补充正常与通知场景后全部通过。[接入文档](integration.md#后续开发交接)明确了后续开发入口、契约升级约束和目标验收顺序。
 
+## 快速接管与消费顺序追加复核
+
+本轮复核异步重试、发布器、客户端版本处理和worker消费流程，发现快速接管时的真实顺序缺陷。原实现只认领空闲至少10秒的pending消息，新leader过早拿到租约时会先读取新消息。例如待确认seq=2仍新鲜时先处理seq=3，把正常序列标记为永久缺口。
+
+现在消费循环要求选主租约上下文，零空闲等待接管pending，并先逐页处理再读新消息；每次状态提交保留租约token的WATCH检查。新增4项检查：1条/101条待确认消息的快速切换、缺少选主上下文拒绝消费，以及提交前租约被替换时旧worker不能写状态/历史/通知，新worker随后可提交。两个顺序反例在修复前失败，修复后通过。测试使用fakeredis，尚不等同于真实Redis进程故障或持久化验收。
+
+本次修复阻止后续错误处理，不自动修补旧版已持久化的缺口状态及乱序history；原始事件核对与迁移限制见接入文档。
+
 ## 可复现验证
 
 ```bash
@@ -110,9 +118,9 @@ uv run python -m compileall -q src tests scripts deploy examples
 uv lock --check
 ```
 
-当前 280 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。Agent示例使用httpx.MockTransport检查响应处理、续接和生命周期；没有连接真实SGLang。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
+当前 284 项本地测试通过。测试证据绑定源码 SHA256，写入 `outputs/plugin-verification.json`，明确包含 `server_acceptance_verified=false` 和 `production_publish_allowed=false`。Redis 事务、流和租约使用 fakeredis/Lua；发布验收对象是明确的模拟夹具。Agent示例使用httpx.MockTransport检查响应处理、续接和生命周期；没有连接真实SGLang。容量探针的本地测试也使用 fakeredis，并模拟内存查询。POSIX目录同步错误为模拟系统调用检查；Windows没有目录fsync验证。
 
-补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整280项测试并通过，未将同一套用例重复计数。示例测试读取工作区示例文件，插件模块在wheel环境中从site-packages导入。
+补丁检查下载固定 commit 的三个原始文件，核对 SHA256、实际应用补丁并验证语法。它不导入 GPU 服务。构建检查另验证 wheel/sdist；本轮源码环境与独立安装的 wheel 环境分别运行完整284项测试并通过，未将同一套用例重复计数。示例测试读取工作区示例文件，插件模块在wheel环境中从site-packages导入。
 
 ## 仍需目标环境证据
 

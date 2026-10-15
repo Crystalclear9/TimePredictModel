@@ -76,6 +76,8 @@ uv run timepredict serve --window-h 2 --tokens-file /etc/timepredict/tokens.json
 
 无模型时返回 unknown，继续采集。跨主机必须有校时证据；时钟不可信时降级。正式服务模板见 `deploy/timepredict.service`。事件经 Redis Streams 顺序、幂等处理，状态、通知和首次历史事件原子提交。生命周期为 prepared→waiting→returned，迟到预测不能复活已闭合记录。
 
+消费任务必须处于leader租约上下文。接管时优先认领全部待确认消息，逐页处理后再读取新消息，不等待消息空闲10秒，避免快速切换时把正常序列误判为缺口。每次状态提交仍检查租约，旧leader失去token后不能写入。
+
 流式发送只把完整的 SSE `data: [DONE]` 行识别为结束；参数中的同名文本不会提前建立 OUT。Agent 示例遇到 length/error/abort 或缺失流结束标记时停止执行工具，并报告取消/终止。
 
 ## 快照、训练、验收发布
