@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .model import _flat_name, _fsync_directory, _read_json_object
+from .model import _flat_name, _fsync_directory
 
 
 def stream_id(value):
@@ -25,12 +25,19 @@ def _next_id(value):
     return f"{ms}-{seq+1}" if seq < 2**64-1 else f"{ms+1}-0"
 
 
-def _index(directory, prefix):
-    path = Path(directory)/"archive-index.json"
-    if not path.exists():
+def _index(directory, prefix, filename="archive-index.json", expected_sha=None):
+    root = Path(directory).resolve()
+    if not _flat_name(filename) or (root/filename).resolve().parent != root:
+        raise ValueError("invalid archive index path")
+    path = root/filename
+    if not path.exists() and expected_sha is None:
         return {"prefix": prefix, "archive_id": uuid.uuid4().hex, "segments": []}
-    index = _read_json_object(path)
-    if index.get("prefix") != prefix or not isinstance(index.get("segments"), list) or not _flat_name(index.get("archive_id")):
+    raw = path.read_bytes()
+    if expected_sha is not None and hashlib.sha256(raw).hexdigest() != expected_sha:
+        raise ValueError("archive index checksum mismatch")
+    index = json.loads(raw)
+    if (not isinstance(index, dict) or index.get("prefix") != prefix or not isinstance(index.get("segments"), list)
+            or not _flat_name(index.get("archive_id"))):
         raise ValueError("archive index does not match prefix")
     last = (0, 0)
     for segment in index["segments"]:
@@ -38,6 +45,19 @@ def _index(directory, prefix):
                 or stream_id(segment["first"]) <= last or stream_id(segment["last"]) < stream_id(segment["first"])):
             raise ValueError("invalid archive segment ordering")
         last = stream_id(segment["last"])
+    return index
+
+
+def _catalogue(directory, prefix, raw_marker):
+    if raw_marker is None:
+        return _index(directory, prefix)
+    marker = json.loads(raw_marker)
+    if (not isinstance(marker, dict) or not isinstance(marker.get("index_sha256"), str)
+            or len(marker["index_sha256"]) != 64):
+        raise ValueError("invalid archive marker")
+    index = _index(directory, prefix, marker.get("index_file", "archive-index.json"), marker["index_sha256"])
+    if marker.get("archive_id") != index["archive_id"]:
+        raise ValueError("archive identity mismatch")
     return index
 
 
@@ -64,11 +84,9 @@ async def read_history(redis, prefix, *, archive_dir=None, max_events=100000, ma
     tail = await redis.xrevrange(prefix+":history", count=1)
     boundary = tail[0][0] if tail else "0-0"
     marker_raw = await redis.get(prefix+":history-archive")
-    marker = json.loads(marker_raw) if marker_raw else None
-    index = _index(archive_dir, prefix) if archive_dir else None
-    if marker and (index is None or marker["archive_id"] != index["archive_id"]
-                   or marker["index_sha256"] != hashlib.sha256((Path(archive_dir)/"archive-index.json").read_bytes()).hexdigest()):
+    if marker_raw is not None and archive_dir is None:
         raise ValueError("verified history archive required before replay")
+    index = _catalogue(archive_dir, prefix, marker_raw) if archive_dir else None
     events, last, used_bytes = [], "0-0", 0
     def append(raw):
         nonlocal used_bytes
@@ -117,10 +135,8 @@ async def archive_history(redis, prefix, directory, *, older_than_days=7., trim_
     try:
         root = Path(directory)
         root.mkdir(parents=True, exist_ok=True)
-        index = _index(root, prefix)
         raw = await redis.get(prefix+":history-archive")
-        if raw and json.loads(raw)["archive_id"] != index["archive_id"]:
-            raise ValueError("archive identity mismatch; do not start a second archive")
+        index = _catalogue(root, prefix, raw)
         for segment in index["segments"]:
             await asyncio.to_thread(_verified_segment, root, segment)
         last = index["segments"][-1]["last"] if index["segments"] else "0-0"
@@ -153,10 +169,14 @@ async def archive_history(redis, prefix, directory, *, older_than_days=7., trim_
         else:
             path.unlink()  # The exclusive, empty file created by this invocation only.
         from .pipeline import atomic_json
-        atomic_json(root/"archive-index.json", index)
+        # Each attempt writes a new catalogue. A displaced writer may finish
+        # local IO, but can never overwrite the replacement's published index.
+        index_name = "archive-index-"+uuid.uuid4().hex+".json"
+        atomic_json(root/index_name, index)
         _fsync_directory(root)
         marker = json.dumps({"archive_id": index["archive_id"],
-                             "index_sha256": hashlib.sha256((root/"archive-index.json").read_bytes()).hexdigest()})
+                             "index_file": index_name,
+                             "index_sha256": hashlib.sha256((root/index_name).read_bytes()).hexdigest()})
         # WATCH the lease and stream types to avoid a partial SET + WRONGTYPE XTRIM.
         async with redis.pipeline(transaction=True) as pipe:
             await pipe.watch(key, prefix+":history", prefix+":history-archive")

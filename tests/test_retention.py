@@ -1,6 +1,7 @@
 """Archival must preserve replay and reject loss, corruption and capacity overruns."""
 import asyncio
 import json
+import hashlib
 
 import httpx
 import pytest
@@ -31,7 +32,8 @@ def test_archive_trim_replay_and_append_are_lossless(tmp_path):
             await read_history(redis, "p", archive_dir=tmp_path, max_events=4)
         with pytest.raises(ValueError, match="history_capacity_exceeded"):
             await read_history(redis, "p", archive_dir=tmp_path, max_bytes=1)
-        index = json.loads((tmp_path/"archive-index.json").read_text())
+        marker = json.loads(await redis.get("p:history-archive"))
+        index = json.loads((tmp_path/marker["index_file"]).read_text())
         (tmp_path/index["segments"][0]["file"]).write_text("corrupt\n")
         with pytest.raises(ValueError, match="checksum"):
             await read_history(redis, "p", archive_dir=tmp_path)
@@ -142,5 +144,86 @@ def test_archive_lost_lease_cannot_trim_history(tmp_path, monkeypatch):
             await archive_history(redis, "p", tmp_path, trim_history=True)
         assert await redis.xlen("p:history") == 1
         assert not await redis.exists("p:history-archive")
+        await redis.aclose()
+    asyncio.run(run())
+
+
+def test_archive_cannot_reseal_a_tampered_catalogue(tmp_path):
+    fakeredis = pytest.importorskip("fakeredis.aioredis")
+    async def run():
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        await redis.xadd("p:history", {"data": '{"event_id":"1"}'}, id="1-0")
+        await archive_history(redis, "p", tmp_path, trim_history=True)
+        original = await redis.get("p:history-archive")
+        marker = json.loads(original)
+        path = tmp_path/marker.get("index_file", "archive-index.json")
+        index = json.loads(path.read_text())
+        index["segments"] = []  # Keep a valid prefix/identity but remove the only archived range.
+        path.write_text(json.dumps(index))
+        with pytest.raises(ValueError, match="checksum"):
+            await archive_history(redis, "p", tmp_path, trim_history=True)
+        assert await redis.get("p:history-archive") == original
+        await redis.aclose()
+    asyncio.run(run())
+
+
+def test_stale_archive_writer_cannot_damage_replacement_catalogue(tmp_path, monkeypatch):
+    fakeredis = pytest.importorskip("fakeredis.aioredis")
+    from timepredict import retention
+    async def run():
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        await redis.xadd("p:history", {"data": '{"event_id":"1"}'}, id="1-0")
+        await archive_history(redis, "p", tmp_path, trim_history=True)
+        loop = asyncio.get_running_loop()
+        verify = retention._verified_segment
+        replaced = False
+        async def takeover():
+            await redis.delete("p:archive-lease")  # Simulate expiry while the old process is paused.
+            await redis.xadd("p:history", {"data": '{"event_id":"2"}'}, id="2-0")
+            await archive_history(redis, "p", tmp_path, trim_history=True)
+        def delayed_verify(directory, segment):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                asyncio.run_coroutine_threadsafe(takeover(), loop).result(timeout=5)
+            return verify(directory, segment)
+        monkeypatch.setattr(retention, "_verified_segment", delayed_verify)
+        with pytest.raises(RuntimeError, match="lease lost"):
+            await archive_history(redis, "p", tmp_path, trim_history=True)
+        marker = json.loads(await redis.get("p:history-archive"))
+        path = tmp_path/marker.get("index_file", "archive-index.json")
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == marker["index_sha256"]
+        assert await read_history(redis, "p", archive_dir=tmp_path) == [{"event_id": "1"}, {"event_id": "2"}]
+        await redis.aclose()
+    asyncio.run(run())
+
+
+def test_legacy_catalogue_migrates_to_immutable_index(tmp_path):
+    fakeredis = pytest.importorskip("fakeredis.aioredis")
+    async def run():
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        await redis.xadd("p:history", {"data": '{"event_id":"1"}'}, id="1-0")
+        await archive_history(redis, "p", tmp_path, trim_history=True)
+        marker = json.loads(await redis.get("p:history-archive"))
+        (tmp_path/"archive-index.json").write_bytes((tmp_path/marker.pop("index_file")).read_bytes())
+        await redis.set("p:history-archive", json.dumps(marker))
+        assert await read_history(redis, "p", archive_dir=tmp_path) == [{"event_id": "1"}]
+        await redis.xadd("p:history", {"data": '{"event_id":"2"}'}, id="2-0")
+        await archive_history(redis, "p", tmp_path, trim_history=True)
+        assert json.loads(await redis.get("p:history-archive"))["index_file"] != "archive-index.json"
+        assert len(await read_history(redis, "p", archive_dir=tmp_path)) == 2
+        await redis.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("raw", ["null", "false", "{}", "[]"])
+@pytest.mark.parametrize("with_directory", [False, True])
+def test_present_but_invalid_marker_cannot_enable_partial_replay(raw, with_directory, tmp_path):
+    fakeredis = pytest.importorskip("fakeredis.aioredis")
+    async def run():
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        await redis.set("p:history-archive", raw)
+        with pytest.raises(ValueError, match="archive required|invalid archive marker"):
+            await read_history(redis, "p", archive_dir=tmp_path if with_directory else None)
         await redis.aclose()
     asyncio.run(run())
