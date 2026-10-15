@@ -1,4 +1,5 @@
 """Any ingress can receive a continuation; its lost telemetry affects other origins."""
+
 import itertools
 import math
 
@@ -10,22 +11,43 @@ from timepredict.training import snapshot
 
 
 def stamp(t, source="A", boot="b"):
-    return {"utc": t, "mono": t, "source": source, "boot": boot, "error": .001, "jumped": False}
+    return {"utc": t, "mono": t, "source": source, "boot": boot, "error": 0.001, "jumped": False}
 
 
 def event(kind, t, *, source="A", boot="b", workflow="old", **extra):
-    return {"kind": kind, "event_id": f"{kind}/{t}/{source}/{boot}/{workflow}", "stamp": stamp(t, source, boot),
-            "tenant": "t", "workflow_id": workflow, "agent_id": "a", "request_id": "r2" if kind == "ingress" else "r1",
-            "source_kind": "sglang", "serial_protocol": True, "latest_tool_ids": ["c"],
-            "call": {"id": "c", "name": "tool", "arguments": "{}"}, **extra}
+    return {
+        "kind": kind,
+        "event_id": f"{kind}/{t}/{source}/{boot}/{workflow}",
+        "stamp": stamp(t, source, boot),
+        "tenant": "t",
+        "workflow_id": workflow,
+        "agent_id": "a",
+        "request_id": "r2" if kind == "ingress" else "r1",
+        "source_kind": "sglang",
+        "serial_protocol": True,
+        "latest_tool_ids": ["c"],
+        "call": {"id": "c", "name": "tool", "arguments": "{}"},
+        **extra,
+    }
 
 
 def predict(state):
     for record in state["records"].values():
-        apply_prediction(state, record["generation"], {"mu": math.log(10), "sigma": .5,
-                         "model_version": "fixture", "distribution_calibrated": True}, "ready")
+        apply_prediction(
+            state,
+            record["generation"],
+            {
+                "mu": math.log(10),
+                "sigma": 0.5,
+                "model_version": "fixture",
+                "distribution_calibrated": True,
+            },
+            "ready",
+        )
     state["processor"] = stamp(6, "worker")
-    return {row["workflow_id"]: row for row in window_rows(state, stamp(6, "worker"), 20)["records"]}
+    return {
+        row["workflow_id"]: row for row in window_rows(state, stamp(6, "worker"), 20)["records"]
+    }
 
 
 @pytest.mark.parametrize("fault", ["gap", "lost"])
@@ -34,8 +56,11 @@ def test_other_ingress_failure_fences_candidates_and_ambiguous_return_labels(fau
     events = [event("source_heartbeat", 0, source="B", seq=1), event("out", 1)]
     if returned:
         events.append(event("ingress", 2))
-    events.append(event("source_heartbeat", 3, source="B", seq=3) if fault == "gap" else
-                  event("source_lost", 3, source="worker", lost_source="B/b", last_seen=0))
+    events.append(
+        event("source_heartbeat", 3, source="B", seq=3)
+        if fault == "gap"
+        else event("source_lost", 3, source="worker", lost_source="B/b", last_seen=0)
+    )
     state = empty_state()
     for item in events:
         state, _ = reduce_event(state, item)
@@ -48,12 +73,18 @@ def test_other_ingress_failure_fences_candidates_and_ambiguous_return_labels(fau
 
 
 @pytest.mark.parametrize("delayed_out", [False, True])
-def test_replacement_observer_does_not_rehabilitate_affected_round_but_allows_new_round(delayed_out):
+def test_replacement_observer_does_not_rehabilitate_affected_round_but_allows_new_round(
+    delayed_out,
+):
     events = [event("source_heartbeat", 0, source="B", seq=1)]
     if not delayed_out:
         events.append(event("out", 1))
-    events.extend([event("source_heartbeat", 3, source="B", seq=3),
-                   event("source_heartbeat", 4, source="B", boot="replacement", seq=1)])
+    events.extend(
+        [
+            event("source_heartbeat", 3, source="B", seq=3),
+            event("source_heartbeat", 4, source="B", boot="replacement", seq=1),
+        ]
+    )
     if delayed_out:
         events.append(event("out", 1))
     events.append(event("out", 5, workflow="new"))
@@ -66,18 +97,26 @@ def test_replacement_observer_does_not_rehabilitate_affected_round_but_allows_ne
 
 
 def test_proven_return_before_last_complete_observer_event_survives_delivery_order():
-    events = [event("out", 1), event("ingress", 3), event("source_heartbeat", 4, source="B", seq=1),
-              event("source_heartbeat", 5, source="B", seq=3)]
+    events = [
+        event("out", 1),
+        event("ingress", 3),
+        event("source_heartbeat", 4, source="B", seq=1),
+        event("source_heartbeat", 5, source="B", seq=3),
+    ]
     for order in itertools.permutations(range(4)):
         if order.index(2) > order.index(3):
             continue  # A publisher preserves its own sequence; independent sources can interleave.
         rows, _ = snapshot([events[i] for i in order], 6)
-        assert len(rows) == 1 and rows[0]["lower"] == 2., order
+        assert len(rows) == 1 and rows[0]["lower"] == 2.0, order
 
 
 def test_earlier_return_proof_can_clear_a_provisional_observation_failure():
-    events = [event("out", 1), event("source_heartbeat", 4, source="B", seq=1),
-              event("ingress", 6), event("source_heartbeat", 5, source="B", seq=3)]
+    events = [
+        event("out", 1),
+        event("source_heartbeat", 4, source="B", seq=1),
+        event("ingress", 6),
+        event("source_heartbeat", 5, source="B", seq=3),
+    ]
     state = empty_state()
     for item in events:
         state, _ = reduce_event(state, item)
@@ -86,15 +125,17 @@ def test_earlier_return_proof_can_clear_a_provisional_observation_failure():
     state, _ = reduce_event(state, events[-1])
     assert not next(iter(state["records"].values())).get("observation_failure")
     rows, _ = snapshot(events, 7)
-    assert len(rows) == 1 and rows[0]["lower"] == 2.
+    assert len(rows) == 1 and rows[0]["lower"] == 2.0
 
 
 @pytest.mark.parametrize("boundary", ["return", "out"])
 def test_cross_clock_error_bounds_do_not_clear_an_ambiguous_gap_boundary(boundary):
-    events = [event("source_heartbeat", 0, source="B", seq=1),
-              event("source_heartbeat", 4, source="B", seq=2),
-              event("source_heartbeat", 5, source="B", seq=4),
-              event("source_heartbeat", 6, source="B", boot="replacement", seq=1)]
+    events = [
+        event("source_heartbeat", 0, source="B", seq=1),
+        event("source_heartbeat", 4, source="B", seq=2),
+        event("source_heartbeat", 5, source="B", seq=4),
+        event("source_heartbeat", 6, source="B", boot="replacement", seq=1),
+    ]
     if boundary == "return":
         events.extend([event("out", 1), event("ingress", 3.999)])
         rows, _ = snapshot(events, 7)
@@ -109,11 +150,13 @@ def test_cross_clock_error_bounds_do_not_clear_an_ambiguous_gap_boundary(boundar
 
 def test_late_event_from_retired_boot_cannot_retire_replacement():
     state = empty_state()
-    for item in [event("source_heartbeat", 0, source="B", seq=1),
-                 event("source_heartbeat", 3, source="B", seq=3),
-                 event("source_heartbeat", 4, source="B", boot="replacement", seq=1),
-                 event("source_heartbeat", 3.5, source="B", seq=4),
-                 event("out", 5, workflow="new")]:
+    for item in [
+        event("source_heartbeat", 0, source="B", seq=1),
+        event("source_heartbeat", 3, source="B", seq=3),
+        event("source_heartbeat", 4, source="B", boot="replacement", seq=1),
+        event("source_heartbeat", 3.5, source="B", seq=4),
+        event("out", 5, workflow="new"),
+    ]:
         state, _ = reduce_event(state, item)
     assert state["sources"]["B/b"]["retired"]
     assert not state["sources"]["B/replacement"].get("retired")
@@ -124,6 +167,7 @@ def test_observer_identity_survives_process_restart_and_defaults_are_replica_spe
     from types import SimpleNamespace
     from timepredict.clock import Clock
     from timepredict.sglang import install
+
     monkeypatch.setenv("TIMEPREDICT_REDIS_URL", "redis://fixture")
     monkeypatch.delenv("TIMEPREDICT_OBSERVER_ID", raising=False)
     captured = []
@@ -141,19 +185,25 @@ def test_observer_identity_survives_process_restart_and_defaults_are_replica_spe
 @pytest.mark.parametrize("first,second", [("host/worker", "host"), ("host", "host/worker")])
 def test_observer_ids_are_compared_exactly_not_as_prefixes(first, second):
     state = empty_state()
-    for item in [event("source_heartbeat", 0, source=first, seq=1),
-                 event("source_heartbeat", 1, source=second, seq=1),
-                 event("source_heartbeat", 2, source=first, seq=2)]:
+    for item in [
+        event("source_heartbeat", 0, source=first, seq=1),
+        event("source_heartbeat", 1, source=second, seq=1),
+        event("source_heartbeat", 2, source=first, seq=2),
+    ]:
         state, _ = reduce_event(state, item)
-    assert not any(source.get("retired") or source.get("bad") for source in state["sources"].values())
+    assert not any(
+        source.get("retired") or source.get("bad") for source in state["sources"].values()
+    )
 
 
 def test_first_late_event_from_older_boot_cannot_retire_new_boot():
     # Consumer-group takeover can encounter a new boot before reclaiming an old pending event.
     state = empty_state()
-    for item in [event("source_heartbeat", 4, source="B", boot="new", seq=1),
-                 event("source_heartbeat", 1, source="B", boot="old", seq=1),
-                 event("out", 5, workflow="new")]:
+    for item in [
+        event("source_heartbeat", 4, source="B", boot="new", seq=1),
+        event("source_heartbeat", 1, source="B", boot="old", seq=1),
+        event("out", 5, workflow="new"),
+    ]:
         state, _ = reduce_event(state, item)
     assert state["sources"]["B/old"].get("retired")
     assert not state["sources"]["B/new"].get("retired")
@@ -179,24 +229,28 @@ def test_ambiguous_boot_order_is_fenced_until_proven_replacement(clock_case):
         first["stamp"]["error"] = None
     elif clock_case == "same_instant":
         second["stamp"]["utc"] = second["stamp"]["mono"] = 1
-        first["stamp"]["error"] = second["stamp"]["error"] = 0.
+        first["stamp"]["error"] = second["stamp"]["error"] = 0.0
     state = empty_state()
     for item in [first, second, event("out", 3, workflow="uncertain")]:
         state, _ = reduce_event(state, item)
     assert predict(state)["uncertain"]["status"] == "unknown"
     if clock_case != "unverified":
         # A later clock-verified boot starts beyond both ambiguous intervals.
-        for item in [event("source_heartbeat", 4, source="B", boot="replacement", seq=1),
-                     event("out", 5, workflow="new")]:
+        for item in [
+            event("source_heartbeat", 4, source="B", boot="replacement", seq=1),
+            event("out", 5, workflow="new"),
+        ]:
             state, _ = reduce_event(state, item)
         assert predict(state)["new"]["status"] == "ready"
 
 
 def test_retired_boot_cannot_emit_an_actionable_new_out():
     state = empty_state()
-    for item in [event("source_heartbeat", 1, source="B", boot="old", seq=1),
-                 event("source_heartbeat", 3, source="B", boot="new", seq=1),
-                 event("out", 4, source="B", boot="old", seq=2)]:
+    for item in [
+        event("source_heartbeat", 1, source="B", boot="old", seq=1),
+        event("source_heartbeat", 3, source="B", boot="new", seq=1),
+        event("out", 4, source="B", boot="old", seq=2),
+    ]:
         state, _ = reduce_event(state, item)
     record = next(iter(state["records"].values()))
     assert not record["valid"] and record["status"] == "source_restart" and not state["pending"]

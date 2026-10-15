@@ -1,5 +1,6 @@
 # 文件作用：确定性事件状态机：业务键标识 Agent，generation 标识轮次，revision 标识可消费状态版本。
 """Deterministic event reducer. Redis owns serialization, never frontend processes."""
+
 import copy
 import hashlib
 import json
@@ -7,17 +8,35 @@ import json
 from .clock import elapsed
 from .freshness import observation_failure, _proven_before
 
-RETRYABLE_PREDICTIONS = {"model_unavailable", "model_acceptance_expired", "prediction_dependency_unavailable"}
+RETRYABLE_PREDICTIONS = {
+    "model_unavailable",
+    "model_acceptance_expired",
+    "prediction_dependency_unavailable",
+}
 
 
 # 将 tenant/workflow/agent 编码为稳定业务键。
 def key_of(event):
-    return json.dumps([event["tenant"], event["workflow_id"], event["agent_id"]], separators=(",", ":"))
+    return json.dumps(
+        [event["tenant"], event["workflow_id"], event["agent_id"]], separators=(",", ":")
+    )
 
 
 # 建立记录、待回返索引、幂等表、来源、孤立入口、心跳与工作流状态。
 def empty_state():
-    return {"records": {}, "pending": {}, "seen": {}, "sources": {}, "orphans": {}, "revision": 0, "heartbeats": {}, "workflows": {}, "ingress_seen": {}, "cancelled_agents": {}, "tombstones": {}}
+    return {
+        "records": {},
+        "pending": {},
+        "seen": {},
+        "sources": {},
+        "orphans": {},
+        "revision": 0,
+        "heartbeats": {},
+        "workflows": {},
+        "ingress_seen": {},
+        "cancelled_agents": {},
+        "tombstones": {},
+    }
 
 
 # 生成租户隔离的 workflow 键。
@@ -28,7 +47,9 @@ def workflow_key(e):
 # 按 event_id 幂等归约事件，维护来源缺口、生命周期、回返关联和待回返状态。
 def reduce_event(original, event, *, copy_state=True):
     state, notices = _reduce_event(original, event, copy_state=copy_state)
-    if state.get("transport_failures") or any(s.get("bad") or s.get("lost") or "failure_since" in s for s in state["sources"].values()):
+    if state.get("transport_failures") or any(
+        s.get("bad") or s.get("lost") or "failure_since" in s for s in state["sources"].values()
+    ):
         for record in state["records"].values():
             if record["status"] not in ("waiting", "returned", "concurrent_conflict"):
                 continue
@@ -41,9 +62,15 @@ def reduce_event(original, event, *, copy_state=True):
                 record.pop("observation_failure", None)
             state["revision"] += 1
             record["revision"] = state["revision"]
-            notices.append({"action": "remove" if failure or record["status"] != "waiting" else "update",
-                            "key": record["key"], "generation": record["generation"],
-                            "revision": state["revision"], "tenant": record["tenant"]})
+            notices.append(
+                {
+                    "action": "remove" if failure or record["status"] != "waiting" else "update",
+                    "key": record["key"],
+                    "generation": record["generation"],
+                    "revision": state["revision"],
+                    "tenant": record["tenant"],
+                }
+            )
     return state, notices
 
 
@@ -55,14 +82,22 @@ def _reduce_event(original, event, *, copy_state=True):
     state["seen"][event["event_id"]] = event["stamp"]["utc"]
     notices = []
     state.setdefault("tombstones", {})
-    if event.get("observed_at", event["stamp"]["utc"]) - event["stamp"]["utc"] > 7*86400:
+    if event.get("observed_at", event["stamp"]["utc"]) - event["stamp"]["utc"] > 7 * 86400:
         return state, notices
 
     # 递增全局及记录 revision，收集更新或移除通知。
     def notice(record, action):
         state["revision"] += 1
         record["revision"] = state["revision"]
-        notices.append({"action": action, "key": record["key"], "generation": record["generation"], "revision": state["revision"], "tenant": record["tenant"]})
+        notices.append(
+            {
+                "action": action,
+                "key": record["key"],
+                "generation": record["generation"],
+                "revision": state["revision"],
+                "tenant": record["tenant"],
+            }
+        )
 
     # 关闭记录并取消有效性；只有 pending 指向当前 generation 才删除索引。
     def invalidate(record, status, closed_stamp=None):
@@ -76,7 +111,9 @@ def _reduce_event(original, event, *, copy_state=True):
         notice(record, "remove")
 
     def cancellation_for(record):
-        admitted = state.get("ingress_seen", {}).get(json.dumps([record["key"], record["request_id"]]), -float("inf"))
+        admitted = state.get("ingress_seen", {}).get(
+            json.dumps([record["key"], record["request_id"]]), -float("inf")
+        )
         history = state.get("cancel_history", {}).get(record["key"], [])
         applicable = [s for s in history if s["utc"] >= admitted]
         if applicable:
@@ -88,7 +125,9 @@ def _reduce_event(original, event, *, copy_state=True):
     if event["kind"] in ("transport_gap", "transport_recovered"):
         failures = state.setdefault("transport_failures", {})
         if event["kind"] == "transport_gap":
-            failures.setdefault(event["gap_id"], {"failure_since": None, "failure_reason": "invalid_event"})
+            failures.setdefault(
+                event["gap_id"], {"failure_since": None, "failure_reason": "invalid_event"}
+            )
         elif event["gap_id"] in failures and event.get("observation_reestablished") is True:
             failure = failures[event["gap_id"]]
             if "failure_until" not in failure:
@@ -96,9 +135,12 @@ def _reduce_event(original, event, *, copy_state=True):
         return state, notices
     if event["kind"] == "source_retired":
         source = state["sources"].get(event["retired_source"])
-        if (not source or source.get("seq") != event["expected_seq"]
-                or (source.get("manually_retired") and source.get("failure_until"))
-                or event.get("routing_fenced") is not True):
+        if (
+            not source
+            or source.get("seq") != event["expected_seq"]
+            or (source.get("manually_retired") and source.get("failure_until"))
+            or event.get("routing_fenced") is not True
+        ):
             return state, notices
         try:
             if not _proven_before(source["last"], stamp):
@@ -109,13 +151,19 @@ def _reduce_event(original, event, *, copy_state=True):
         source.setdefault("failure_reason", "source_retired")
         source.update(retired=True, manually_retired=True, failure_until=stamp)
         for record in list(state["records"].values()):
-            if (record["status"] == "waiting" and
-                    record["out"]["source"]+"/"+record["out"]["boot"] == event["retired_source"]):
+            if (
+                record["status"] == "waiting"
+                and record["out"]["source"] + "/" + record["out"]["boot"] == event["retired_source"]
+            ):
                 invalidate(record, "source_retired")
         return state, notices
     if event["kind"] == "source_lost":
         source = state["sources"].get(event["lost_source"])
-        if not source or source.get("retired") or source["last"]["utc"] != event.get("last_seen", source["last"]["utc"]):
+        if (
+            not source
+            or source.get("retired")
+            or source["last"]["utc"] != event.get("last_seen", source["last"]["utc"])
+        ):
             return state, notices
         if source:
             source.setdefault("failure_since", source["last"] if not source.get("bad") else None)
@@ -123,8 +171,9 @@ def _reduce_event(original, event, *, copy_state=True):
             source["bad"], source["lost"] = True, True
         for record in list(state["records"].values()):
             out_stamp = record.get("out", {})
-            if (record["status"] == "waiting" and
-                    out_stamp.get("source", "") + "/" + out_stamp.get("boot", "") == event.get("lost_source")):
+            if record["status"] == "waiting" and out_stamp.get("source", "") + "/" + out_stamp.get(
+                "boot", ""
+            ) == event.get("lost_source"):
                 invalidate(record, "observation_lost")
         return state, notices
     source_key = stamp["source"] + "/" + stamp["boot"]
@@ -142,28 +191,46 @@ def _reduce_event(original, event, *, copy_state=True):
         source.setdefault("first", source.get("last", stamp))
         gap = event["seq"] != source["seq"] + 1 or event["kind"] == "gap"
         if gap:
-            source.setdefault("failure_since", source.get("last") if not source.get("bad") else None)
+            source.setdefault(
+                "failure_since", source.get("last") if not source.get("bad") else None
+            )
             source.setdefault("failure_reason", "observation_gap")
             source["bad"] = True
             for record in list(state["records"].values()):
-                if record["status"] == "waiting" and record.get("out", {}).get("source", "") + "/" + record.get("out", {}).get("boot", "") == source_key:
+                if (
+                    record["status"] == "waiting"
+                    and record.get("out", {}).get("source", "")
+                    + "/"
+                    + record.get("out", {}).get("boot", "")
+                    == source_key
+                ):
                     invalidate(record, "observation_gap")
         source["seq"] = max(source["seq"], event["seq"])
         source["last"] = stamp
         if "telemetry" in event:
             source["telemetry"] = event["telemetry"]
         state["sources"][source_key] = source
+
         def retire(retired_key, retired, replacement_stamp):
             retired.setdefault("failure_since", retired["last"] if not retired.get("bad") else None)
             retired.setdefault("failure_reason", "source_restart")
             retired["failure_until"] = replacement_stamp
             retired["retired"] = True
             for record in list(state["records"].values()):
-                if record["status"] == "waiting" and record["out"].get("source", "") + "/" + record["out"].get("boot", "") == retired_key:
+                if (
+                    record["status"] == "waiting"
+                    and record["out"].get("source", "") + "/" + record["out"].get("boot", "")
+                    == retired_key
+                ):
                     invalidate(record, "source_restart")
+
         for old_key, old in state["sources"].items():
-            if (not source.get("retired") and old["last"].get("source") == stamp["source"]
-                    and old_key != source_key and not old.get("retired")):
+            if (
+                not source.get("retired")
+                and old["last"].get("source") == stamp["source"]
+                and old_key != source_key
+                and not old.get("retired")
+            ):
                 # An old pending event may first appear after its replacement.
                 # Choose boots by proven clock bounds, not consumer delivery order.
                 try:
@@ -208,15 +275,33 @@ def _reduce_event(original, event, *, copy_state=True):
             if workflow["end"] is None or stamp["utc"] < workflow["end"]:
                 workflow["end"], workflow["end_stamp"] = stamp["utc"], stamp
         for record in list(state["records"].values()):
-            generation_matches = event["kind"] != "expire" or event.get("generation", record["generation"]) == record["generation"]
-            eligible = record["status"] == "waiting" or (record["status"] == "concurrent_conflict" and not record.get("return")) or (record["status"] == "returned" and event["kind"] in ("cancel", "terminate"))
-            if generation_matches and eligible and (record["key"] == key or (event["kind"] == "terminate" and workflow_key(record) == wf)):
+            generation_matches = (
+                event["kind"] != "expire"
+                or event.get("generation", record["generation"]) == record["generation"]
+            )
+            eligible = (
+                record["status"] == "waiting"
+                or (record["status"] == "concurrent_conflict" and not record.get("return"))
+                or (record["status"] == "returned" and event["kind"] in ("cancel", "terminate"))
+            )
+            if (
+                generation_matches
+                and eligible
+                and (
+                    record["key"] == key
+                    or (event["kind"] == "terminate" and workflow_key(record) == wf)
+                )
+            ):
                 if event["kind"] == "cancel":
                     closing = cancellation_for(record)
                     if closing is None:
                         continue  # A delayed cancellation of an earlier admitted round.
                 else:
-                    closing = state["workflows"][wf].get("end_stamp", stamp) if event["kind"] == "terminate" else stamp
+                    closing = (
+                        state["workflows"][wf].get("end_stamp", stamp)
+                        if event["kind"] == "terminate"
+                        else stamp
+                    )
                 if record["status"] == "returned":
                     try:
                         elapsed(closing, record["return"])
@@ -224,7 +309,15 @@ def _reduce_event(original, event, *, copy_state=True):
                         if str(exc) != "invalid_interval":
                             invalidate(record, "lifecycle_clock_uncertain", closing)
                         continue  # The proven return precedes this terminal event.
-                invalidate(record, {"cancel": "cancelled", "terminate": "terminated", "expire": "observation_lost"}[event["kind"]], closing)
+                invalidate(
+                    record,
+                    {
+                        "cancel": "cancelled",
+                        "terminate": "terminated",
+                        "expire": "observation_lost",
+                    }[event["kind"]],
+                    closing,
+                )
         return state, notices
 
     # 关联续接请求并计算时间标签；明确 ID 优先，无 ID 时允许串行降级且标记 degraded。
@@ -236,20 +329,33 @@ def _reduce_event(original, event, *, copy_state=True):
                 recovered = elapsed(incoming["stamp"], record["closed_stamp"]) > 0
             except ValueError:
                 pass
-        if (record["status"] not in ("waiting", "concurrent_conflict") and not recovered) or record.get("return") or incoming["request_id"] == record["request_id"]:
+        if (
+            (record["status"] not in ("waiting", "concurrent_conflict") and not recovered)
+            or record.get("return")
+            or incoming["request_id"] == record["request_id"]
+        ):
             return False
         # Under the serial protocol the tenant/workflow/agent key identifies
         # the only outstanding round. If the continuation includes tool IDs,
         # require the recorded ID to be present; older clients may omit the
         # list, in which case the serial invariant is the association proof.
-        supplied = bool(incoming.get("tool_call_ids_present", bool(incoming.get("latest_tool_ids"))))
+        supplied = bool(
+            incoming.get("tool_call_ids_present", bool(incoming.get("latest_tool_ids")))
+        )
         incoming_ids = incoming.get("latest_tool_ids") or []
         if record.get("association_mismatch") and not supplied:
             return False
         if supplied and record["call"].get("id") not in incoming_ids:
-            record["association_mismatch"] = {"request_id": incoming["request_id"], "tool_ids": incoming_ids,
-                                               "at": incoming["stamp"]}
-            record["status_reason"] = "historical_tool_result" if incoming.get("historical_tool_ids") else "association_mismatch"
+            record["association_mismatch"] = {
+                "request_id": incoming["request_id"],
+                "tool_ids": incoming_ids,
+                "at": incoming["stamp"],
+            }
+            record["status_reason"] = (
+                "historical_tool_result"
+                if incoming.get("historical_tool_ids")
+                else "association_mismatch"
+            )
             return False
         cancelled = cancellation_for(record)
         if cancelled is not None and cancelled["utc"] <= incoming["stamp"]["utc"]:
@@ -272,7 +378,9 @@ def _reduce_event(original, event, *, copy_state=True):
         record["association_mode"] = "tool_call_id" if supplied else "serial_fallback"
         record["association_confidence"] = "verified" if supplied else "degraded"
         record["tool_call_id_verified"] = supplied
-        record["serial_verified"] = bool(record.get("serial_protocol") and incoming.get("serial_protocol"))
+        record["serial_verified"] = bool(
+            record.get("serial_protocol") and incoming.get("serial_protocol")
+        )
         if not supplied and record["serial_verified"]:
             record["association_confidence"] = "verified_serial_protocol"
         record["closed_at"] = incoming["stamp"]["utc"]
@@ -298,8 +406,14 @@ def _reduce_event(original, event, *, copy_state=True):
     def reconcile_intervals():
         # Conflicts stop predictions immediately, but delayed ingress can prove a
         # seemingly overlapping interval was actually serial. Preserve both OUTs.
-        records = sorted((r for r in state["records"].values() if r["key"] == key and
-                          r["status"] in ("waiting", "returned", "concurrent_conflict")), key=lambda r: r["out"]["utc"])
+        records = sorted(
+            (
+                r
+                for r in state["records"].values()
+                if r["key"] == key and r["status"] in ("waiting", "returned", "concurrent_conflict")
+            ),
+            key=lambda r: r["out"]["utc"],
+        )
         groups, group, end = [], [], None
         for record in records:
             separate = False
@@ -355,9 +469,14 @@ def _reduce_event(original, event, *, copy_state=True):
         # The earliest proven ingress after OUT is the serial successor; revise a
         # provisional later match and return it to the orphan pool for its own round.
         for record in state["records"].values():
-            if (record["key"] != key or record.get("association_mode") not in ("serial_fallback", "tool_call_id")
-                    or not record.get("return_event") or record["request_id"] == incoming["request_id"]
-                    or record["status"] not in ("returned", "concurrent_conflict", "cancelled", "terminated")):
+            if (
+                record["key"] != key
+                or record.get("association_mode") not in ("serial_fallback", "tool_call_id")
+                or not record.get("return_event")
+                or record["request_id"] == incoming["request_id"]
+                or record["status"]
+                not in ("returned", "concurrent_conflict", "cancelled", "terminated")
+            ):
                 continue
             supplied = incoming.get("tool_call_ids_present", bool(incoming.get("latest_tool_ids")))
             if record.get("association_mode") == "tool_call_id" and not supplied:
@@ -365,13 +484,26 @@ def _reduce_event(original, event, *, copy_state=True):
             if supplied and record["call"].get("id") not in (incoming.get("latest_tool_ids") or []):
                 continue
             try:
-                if elapsed(record["out"], incoming["stamp"]) <= 0 or elapsed(incoming["stamp"], record["return"]) <= 0:
+                if (
+                    elapsed(record["out"], incoming["stamp"]) <= 0
+                    or elapsed(incoming["stamp"], record["return"]) <= 0
+                ):
                     continue
             except ValueError:
                 continue
             state["orphans"].setdefault(key, []).append(record["return_event"])
-            for field in ("return", "return_event", "return_event_id", "return_request_id", "return_source_kind",
-                          "duration", "association_mode", "association_confidence", "tool_call_id_verified", "serial_verified"):
+            for field in (
+                "return",
+                "return_event",
+                "return_event_id",
+                "return_request_id",
+                "return_source_kind",
+                "duration",
+                "association_mode",
+                "association_confidence",
+                "tool_call_id_verified",
+                "serial_verified",
+            ):
                 record.pop(field, None)
             record["status"], record["valid"] = "waiting", True
             for member in state["records"].values():
@@ -397,7 +529,11 @@ def _reduce_event(original, event, *, copy_state=True):
         state["ingress_seen"][request_key] = stamp["utc"]
         ingress_stamps[request_key] = stamp
         correct_association(event)
-        candidates = sorted((r for r in state["records"].values() if r["key"] == key), key=lambda r: r["out"]["utc"], reverse=True)
+        candidates = sorted(
+            (r for r in state["records"].values() if r["key"] == key),
+            key=lambda r: r["out"]["utc"],
+            reverse=True,
+        )
         for record in candidates:
             if close(record, event):
                 reconcile_intervals()
@@ -406,8 +542,11 @@ def _reduce_event(original, event, *, copy_state=True):
                 while queue:
                     orphan = queue.pop(0)
                     correct_association(orphan)
-                    choices = sorted((r for r in state["records"].values() if r["key"] == key),
-                                     key=lambda r: r["out"]["utc"], reverse=True)
+                    choices = sorted(
+                        (r for r in state["records"].values() if r["key"] == key),
+                        key=lambda r: r["out"]["utc"],
+                        reverse=True,
+                    )
                     if any(close(r, orphan) for r in choices):
                         reconcile_intervals()
                     else:
@@ -425,10 +564,23 @@ def _reduce_event(original, event, *, copy_state=True):
         # Prepared is an observable lifecycle event before the response is sent.
         gen = hashlib.sha256((key + "/" + event["request_id"]).encode()).hexdigest()
         if gen not in state["records"] and gen not in state["tombstones"]:
-            state["records"][gen] = {"key": key, "generation": gen, "tenant": event["tenant"], "workflow_id": event["workflow_id"],
-                "agent_id": event["agent_id"], "request_id": event["request_id"], "call": event["call"], "out": stamp,
-                "status": "prepared", "valid": False, "prediction": None, "prediction_status": "not_ready",
-                "workflow_start": state["workflows"][wf]["start"], "lifecycle": ["prepared"], "lifecycle_state": "prepared"}
+            state["records"][gen] = {
+                "key": key,
+                "generation": gen,
+                "tenant": event["tenant"],
+                "workflow_id": event["workflow_id"],
+                "agent_id": event["agent_id"],
+                "request_id": event["request_id"],
+                "call": event["call"],
+                "out": stamp,
+                "status": "prepared",
+                "valid": False,
+                "prediction": None,
+                "prediction_status": "not_ready",
+                "workflow_start": state["workflows"][wf]["start"],
+                "lifecycle": ["prepared"],
+                "lifecycle_state": "prepared",
+            }
         return state, notices
     if kind == "out":
         gen = hashlib.sha256((key + "/" + event["request_id"]).encode()).hexdigest()
@@ -439,14 +591,30 @@ def _reduce_event(original, event, *, copy_state=True):
                 prepared = existing
             else:
                 return state, notices
-        if gen in state["tombstones"]: return state, notices
-        record = {"key": key, "generation": gen, "tenant": event["tenant"], "workflow_id": event["workflow_id"],
-                  "agent_id": event["agent_id"], "request_id": event["request_id"], "call": event["call"],
-                  "out": stamp, "status": "waiting", "valid": True, "prediction": None,
-                  "prediction_status": "pending_prediction", "workflow_start": state["workflows"][wf]["start"],
-                  "lifecycle": ["waiting"], "lifecycle_state": "waiting"}
-        record.update(out_event_id=event["event_id"], source_kind=event.get("source_kind"),
-                      serial_protocol=event.get("serial_protocol", False))
+        if gen in state["tombstones"]:
+            return state, notices
+        record = {
+            "key": key,
+            "generation": gen,
+            "tenant": event["tenant"],
+            "workflow_id": event["workflow_id"],
+            "agent_id": event["agent_id"],
+            "request_id": event["request_id"],
+            "call": event["call"],
+            "out": stamp,
+            "status": "waiting",
+            "valid": True,
+            "prediction": None,
+            "prediction_status": "pending_prediction",
+            "workflow_start": state["workflows"][wf]["start"],
+            "lifecycle": ["waiting"],
+            "lifecycle_state": "waiting",
+        }
+        record.update(
+            out_event_id=event["event_id"],
+            source_kind=event.get("source_kind"),
+            serial_protocol=event.get("serial_protocol", False),
+        )
         if prepared:
             record["lifecycle"] = prepared["lifecycle"] + ["waiting"]
         state["records"][gen] = record
@@ -486,21 +654,32 @@ def _reduce_event(original, event, *, copy_state=True):
 # 仅给仍 waiting 且 pending_prediction 的轮次写预测，防止迟到结果复活旧候选。
 def apply_prediction(state, generation, prediction, status, available_at=None):
     record = state["records"].get(generation)
-    if (not record or record["status"] != "waiting"
-            or record["prediction_status"] not in {"pending_prediction", *RETRYABLE_PREDICTIONS}):
+    if (
+        not record
+        or record["status"] != "waiting"
+        or record["prediction_status"] not in {"pending_prediction", *RETRYABLE_PREDICTIONS}
+    ):
         return []
     record["prediction"], record["prediction_status"] = prediction, status
     if available_at is not None:
         record["prediction_available_at"] = available_at
         if status in RETRYABLE_PREDICTIONS:
-            attempts = record.get("prediction_attempts", 0)+1
+            attempts = record.get("prediction_attempts", 0) + 1
             record["prediction_attempts"] = attempts
-            record["prediction_retry_at"] = available_at["utc"]+min(30., 2.**min(attempts, 5))
+            record["prediction_retry_at"] = available_at["utc"] + min(30.0, 2.0 ** min(attempts, 5))
         else:
             record.pop("prediction_retry_at", None)
     state["revision"] += 1
     record["revision"] = state["revision"]
-    return [{"action": "update", "tenant": record["tenant"], "key": record["key"], "generation": generation, "revision": state["revision"]}]
+    return [
+        {
+            "action": "update",
+            "tenant": record["tenant"],
+            "key": record["key"],
+            "generation": generation,
+            "revision": state["revision"],
+        }
+    ]
 
 
 # 清理一小时以上闭合热记录，用七天 tombstone 保留幂等；训练历史流独立保留。
@@ -508,25 +687,28 @@ def compact(state, now):
     """Bound online history; the immutable Redis history stream remains the training source."""
     state.setdefault("tombstones", {})
     for gen, record in list(state["records"].items()):
-        if record["status"] != "waiting" and now-record.get("closed_at", record["out"]["utc"]) > 3600:
+        if (
+            record["status"] != "waiting"
+            and now - record.get("closed_at", record["out"]["utc"]) > 3600
+        ):
             state["tombstones"][gen] = record["out"]["utc"]
             del state["records"][gen]
     for name in ("seen", "tombstones", "ingress_seen", "cancelled_agents"):
         for key, timestamp in list(state.get(name, {}).items()):
-            if now-timestamp > 7*86400:
+            if now - timestamp > 7 * 86400:
                 del state[name][key]
     for key, events in list(state["orphans"].items()):
-        retained = [e for e in events if now-e["stamp"]["utc"] <= 7*86400]
+        retained = [e for e in events if now - e["stamp"]["utc"] <= 7 * 86400]
         if retained:
             state["orphans"][key] = retained
         else:
             del state["orphans"][key]
     active_workflows = {workflow_key(state["records"][g]) for g in state["pending"].values()}
     for key, workflow in list(state["workflows"].items()):
-        if key not in active_workflows and now-(workflow["end"] or workflow["start"]) > 7*86400:
+        if key not in active_workflows and now - (workflow["end"] or workflow["start"]) > 7 * 86400:
             del state["workflows"][key]
     for key, timestamp in list(state["heartbeats"].items()):
-        if now-timestamp > 7*86400:
+        if now - timestamp > 7 * 86400:
             del state["heartbeats"][key]
             state.get("heartbeat_stamps", {}).pop(key, None)
     for key in list(state.get("cancelled_agent_stamps", {})):
@@ -536,7 +718,7 @@ def compact(state, now):
         if key not in state["ingress_seen"]:
             del state["ingress_stamps"][key]
     for key, stamps in list(state.get("cancel_history", {}).items()):
-        recent = [s for s in stamps if now-s["utc"] <= 7*86400]
+        recent = [s for s in stamps if now - s["utc"] <= 7 * 86400]
         if recent:
             state["cancel_history"][key] = recent
         else:

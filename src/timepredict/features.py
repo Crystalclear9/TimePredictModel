@@ -19,7 +19,9 @@ class UnsupportedInput(ValueError):
 
 # 生成稳定且严格的 JSON 表示；排序键并拒绝 NaN/Infinity。
 def canonical(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
 
 
 # 把对象/JSON 字符串规范化为字典，检查 256KiB 大小及 32 层深度上限。
@@ -28,11 +30,14 @@ def parse_arguments(arguments):
         if isinstance(arguments, str):
             if len(arguments.encode("utf-8")) > MAX_BYTES:
                 raise UnsupportedInput("arguments_too_large")
-            arguments = json.loads(arguments, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x)))
+            arguments = json.loads(
+                arguments, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x))
+            )
         if not isinstance(arguments, dict):
             raise UnsupportedInput("arguments_not_object")
         if len(canonical(arguments).encode("utf-8")) > MAX_BYTES:
             raise UnsupportedInput("arguments_too_large")
+
         # 递归检查对象和数组的嵌套深度。
         def check(v, depth):
             if depth > MAX_DEPTH:
@@ -43,6 +48,7 @@ def parse_arguments(arguments):
             elif isinstance(v, list):
                 for child in v:
                     check(child, depth + 1)
+
         check(arguments, 0)
         return arguments
     except (ValueError, TypeError, RecursionError, UnicodeError) as exc:
@@ -51,7 +57,12 @@ def parse_arguments(arguments):
 
 # 提取数值、布尔、字符串长度、数组长度、枚举指示和通用结构统计。
 def extract(call, use_action_family=True):
-    if not isinstance(call, dict) or not isinstance(call.get("name"), str) or not call["name"] or "arguments" not in call:
+    if (
+        not isinstance(call, dict)
+        or not isinstance(call.get("name"), str)
+        or not call["name"]
+        or "arguments" not in call
+    ):
         raise UnsupportedInput("invalid_call")
     args = parse_arguments(call["arguments"])
     tool = call.get("action_family", call["name"]) if use_action_family else call["name"]
@@ -91,11 +102,24 @@ def extract(call, use_action_family=True):
         elif isinstance(value, list):
             kind = "array"
             put(path, "length", len(value))
+
             # Count structure inside arrays without generating position-specific fields.
             # 数组内部只累计类型、字段及深度统计，不建立位置相关特征列。
             def count_array(v, d):
                 stats["max_depth"] = max(stats["max_depth"], d)
-                typ = "null" if v is None else "boolean" if isinstance(v, bool) else "object" if isinstance(v, dict) else "array" if isinstance(v, list) else "string" if isinstance(v, str) else "number"
+                typ = (
+                    "null"
+                    if v is None
+                    else "boolean"
+                    if isinstance(v, bool)
+                    else "object"
+                    if isinstance(v, dict)
+                    else "array"
+                    if isinstance(v, list)
+                    else "string"
+                    if isinstance(v, str)
+                    else "number"
+                )
                 stats[typ] += 1
                 if isinstance(v, dict):
                     stats["fields"] += len(v)
@@ -104,6 +128,7 @@ def extract(call, use_action_family=True):
                 elif isinstance(v, list):
                     for child in v:
                         count_array(child, d + 1)
+
             for child in value:
                 count_array(child, depth + 1)
         elif isinstance(value, dict):
@@ -119,7 +144,11 @@ def extract(call, use_action_family=True):
             # Include zero columns for every declared enum, not just the observed value.
             for choice in schema["enum"]:
                 put(path, "enum:" + canonical(choice), float(canonical(value) == canonical(choice)))
-            put(path, "enum:unknown", float(all(canonical(value) != canonical(c) for c in schema["enum"])))
+            put(
+                path,
+                "enum:unknown",
+                float(all(canonical(value) != canonical(c) for c in schema["enum"])),
+            )
 
     try:
         walk(args, "", call.get("schema", {}), 0)
@@ -130,7 +159,17 @@ def extract(call, use_action_family=True):
     return fields, stats
 
 
-STATS = ("json_bytes", "max_depth", "fields", "null", "boolean", "number", "string", "array", "object")
+STATS = (
+    "json_bytes",
+    "max_depth",
+    "fields",
+    "null",
+    "boolean",
+    "number",
+    "string",
+    "array",
+    "object",
+)
 
 
 # 保存工具/动作族词典、结构字段和固定语义编码器契约。
@@ -156,15 +195,29 @@ class FeatureSpec:
         for call in calls:
             fields, _ = extract(call, use_action_family=feature_mode == "legacy_semantic")
             counts.update(fields.keys())
-            tools.add(call.get("action_family", call["name"]) if feature_mode == "legacy_semantic" else call["name"])
+            tools.add(
+                call.get("action_family", call["name"])
+                if feature_mode == "legacy_semantic"
+                else call["name"]
+            )
         if feature_mode == "structured":
-            return cls(sorted(tools), sorted(counts, key=lambda k: (-counts[k], k))[:max_fields],
-                       embedding_dim=0, embedding_kind="none", feature_mode=feature_mode)
+            return cls(
+                sorted(tools),
+                sorted(counts, key=lambda k: (-counts[k], k))[:max_fields],
+                embedding_dim=0,
+                embedding_kind="none",
+                feature_mode=feature_mode,
+            )
         encoder = SemanticEncoder()
-        spec = cls(sorted(tools), sorted(counts, key=lambda k: (-counts[k], k))[:max_fields],
-                   embedding_dim=encoder.dim, embedding_model=encoder.model_name,
-                   embedding_revision=encoder.revision, embedding_kind=encoder.backend,
-                   feature_mode=feature_mode)
+        spec = cls(
+            sorted(tools),
+            sorted(counts, key=lambda k: (-counts[k], k))[:max_fields],
+            embedding_dim=encoder.dim,
+            embedding_model=encoder.model_name,
+            embedding_revision=encoder.revision,
+            embedding_kind=encoder.backend,
+            feature_mode=feature_mode,
+        )
         object.__setattr__(spec, "_encoder", encoder)
         return spec
 
@@ -173,18 +226,27 @@ class FeatureSpec:
         if self.version not in (3, VERSION):
             raise ValueError("feature_version_mismatch")
         fields, stats = extract(call, use_action_family=self.feature_mode == "legacy_semantic")
-        action = call.get("action_family", call["name"]) if self.feature_mode == "legacy_semantic" else call["name"]
+        action = (
+            call.get("action_family", call["name"])
+            if self.feature_mode == "legacy_semantic"
+            else call["name"]
+        )
         values = [float(action == t) for t in self.tools]
         values += [float(action not in self.tools)]
         if self.feature_mode != "structured":
             encoder = getattr(self, "_encoder", None)
             if encoder is None:
-                encoder = SemanticEncoder(self.embedding_model, revision=self.embedding_revision,
-                                          device="cpu")
+                encoder = SemanticEncoder(
+                    self.embedding_model, revision=self.embedding_revision, device="cpu"
+                )
                 object.__setattr__(self, "_encoder", encoder)
             if encoder.dim != self.embedding_dim or encoder.backend != self.embedding_kind:
                 raise ValueError("embedding_dimension_mismatch")
-            values += (encoder.encode_call(call) if self.feature_mode == "semantic" else encoder.encode(call)).tolist()
+            values += (
+                encoder.encode_call(call)
+                if self.feature_mode == "semantic"
+                else encoder.encode(call)
+            ).tolist()
         values += [float(stats[k]) for k in STATS]
         values += [fields.get(k, float("nan")) for k in self.fields]
         return np.asarray(values, dtype=np.float32)

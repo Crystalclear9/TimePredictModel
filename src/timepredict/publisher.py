@@ -26,13 +26,29 @@ class Publisher:
 
     # 输出队列深度、累计丢弃及每个钩子的窗口 P99。
     def telemetry(self):
-        return {"queue_depth": self.queue.qsize(), "dropped": self.dropped,
-                "hook_seconds": {phase: {"samples": len(values), "p99": sorted(values)[int((len(values)-1)*0.99)]} for phase, values in self.overheads.items() if values}}
+        return {
+            "queue_depth": self.queue.qsize(),
+            "dropped": self.dropped,
+            "hook_seconds": {
+                phase: {
+                    "samples": len(values),
+                    "p99": sorted(values)[int((len(values) - 1) * 0.99)],
+                }
+                for phase, values in self.overheads.items()
+                if values
+            },
+        }
 
     # 非阻塞入队；先增加 seq，使队列溢出能在后续事件中表现为序号缺口。
     def emit(self, kind, payload=None, stamp=None):
         self.seq += 1
-        event = {**(payload or {}), "kind": kind, "stamp": stamp or self.clock.stamp(), "seq": self.seq, "event_id": uuid.uuid4().hex}
+        event = {
+            **(payload or {}),
+            "kind": kind,
+            "stamp": stamp or self.clock.stamp(),
+            "seq": self.seq,
+            "event_id": uuid.uuid4().hex,
+        }
         try:
             self.queue.put_nowait(event)
         except asyncio.QueueFull:
@@ -61,7 +77,9 @@ class Publisher:
             except (TypeError, ValueError, UnicodeError, RecursionError):
                 self.dropped += 1
                 self.queue.task_done()
-                logger.exception("timepredict non-JSON event dropped; following sequence exposes the gap")
+                logger.exception(
+                    "timepredict non-JSON event dropped; following sequence exposes the gap"
+                )
                 continue
             delay = 0.1
             while True:

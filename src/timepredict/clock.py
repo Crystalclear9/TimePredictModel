@@ -13,7 +13,15 @@ class Clock:
         if source_id is not None and (not isinstance(source_id, str) or not source_id):
             raise ValueError("source_id must be a nonempty string")
         self.boot = uuid.uuid4().hex
-        self.source = source_id or (os.environ.get("TIMEPREDICT_SOURCE", os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "host")) + f":{os.getpid()}")
+        self.source = source_id or (
+            os.environ.get(
+                "TIMEPREDICT_SOURCE",
+                os.uname().nodename
+                if hasattr(os, "uname")
+                else os.environ.get("COMPUTERNAME", "host"),
+            )
+            + f":{os.getpid()}"
+        )
         self.error_seconds = error_seconds
         self.last = None
         self.jumped = False
@@ -25,9 +33,17 @@ class Clock:
             return
         self.last_probe = time.monotonic()
         try:
-            row = subprocess.check_output(["chronyc", "-c", "tracking"], timeout=2, text=True).strip().split(",")
+            row = (
+                subprocess.check_output(["chronyc", "-c", "tracking"], timeout=2, text=True)
+                .strip()
+                .split(",")
+            )
             # chronyc CSV: system offset, root delay, root dispersion, leap status.
-            self.error_seconds = abs(float(row[4])) + abs(float(row[10])) / 2 + abs(float(row[11])) if row[-1] == "Normal" else None
+            self.error_seconds = (
+                abs(float(row[4])) + abs(float(row[10])) / 2 + abs(float(row[11]))
+                if row[-1] == "Normal"
+                else None
+            )
         except (OSError, subprocess.SubprocessError, ValueError, IndexError):
             self.error_seconds = None
 
@@ -37,8 +53,14 @@ class Clock:
         if self.last and abs((wall - self.last[0]) - (mono - self.last[1])) > 0.005:
             self.jumped = True
         self.last = (wall, mono)
-        return {"utc": wall, "mono": mono, "source": self.source, "boot": self.boot,
-                "error": self.error_seconds, "jumped": self.jumped}
+        return {
+            "utc": wall,
+            "mono": mono,
+            "source": self.source,
+            "boot": self.boot,
+            "error": self.error_seconds,
+            "jumped": self.jumped,
+        }
 
 
 # 计算秒数差；跨来源误差总和必须不超过预算，负值/非有限值直接拒绝。

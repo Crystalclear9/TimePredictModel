@@ -1,5 +1,6 @@
 # 文件作用：候选消费端缓存：利用 generation/revision 拒绝旧通知，用单调时间执行本地过期。
 """C2-side lease cache: expiry is enforced even when no new messages arrive."""
+
 import copy
 import time
 
@@ -17,19 +18,23 @@ class CandidateCache:
 
     # 从有效期扣除网络往返时间；仅缓存 ready 且已入窗的记录。
     def _put(self, row, roundtrip_seconds, received_at):
-        ttl = max(0., row.get("valid_for_seconds", 0.)-roundtrip_seconds)
+        ttl = max(0.0, row.get("valid_for_seconds", 0.0) - roundtrip_seconds)
         if row.get("status") != "ready" or not row.get("in_window") or ttl <= 0:
             self.records.pop(row["key"], None)
         else:
-            self.records[row["key"]] = (copy.deepcopy(row), received_at+ttl)
+            self.records[row["key"]] = (copy.deepcopy(row), received_at + ttl)
 
     # 接受足够新的全量快照，重建缓存并设置旧通知过滤下界。
-    def snapshot(self, snapshot, roundtrip_seconds=0.):
+    def snapshot(self, snapshot, roundtrip_seconds=0.0):
         received_at = self.clock()
         if snapshot["revision"] < self.high_water:
             return False
         stamp = snapshot.get("snapshot_utc")
-        if self.snapshot_stamp is not None and stamp is not None and snapshot["revision"] == self.floor:
+        if (
+            self.snapshot_stamp is not None
+            and stamp is not None
+            and snapshot["revision"] == self.floor
+        ):
             if stamp <= self.snapshot_stamp:
                 return False
         if stamp is None and snapshot["revision"] == self.floor and self.snapshot_stamp is not None:
@@ -45,7 +50,7 @@ class CandidateCache:
         return True
 
     # 业务键版本过滤更新；移除只作用于同轮且更旧的候选。
-    def notice(self, item, roundtrip_seconds=0.):
+    def notice(self, item, roundtrip_seconds=0.0):
         """Return whether cached candidate content changed, never renew a replayed lease."""
         received_at = self.clock()
         revision, key = item["revision"], item["key"]
@@ -59,7 +64,11 @@ class CandidateCache:
             # Still apply a matching removal below another round's fence: that
             # other tombstone deliberately did not remove this cached generation.
             current = self.records.get(key)
-            if current and current[0]["generation"] == item["generation"] and revision > current[0]["revision"]:
+            if (
+                current
+                and current[0]["generation"] == item["generation"]
+                and revision > current[0]["revision"]
+            ):
                 del self.records[key]
                 return True
         elif item["action"] == "candidate_update" and revision > previous:

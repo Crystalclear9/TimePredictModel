@@ -10,10 +10,23 @@ version = "0.1.0"
 description = "Observed tool-return distributions for SGLang scheduling"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26,<3", "scipy>=1.12,<2", "xgboost>=2.1,<4", "redis>=5,<7", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.27,<1"]
+dependencies = [
+    "numpy>=1.26,<3",
+    "scipy>=1.12,<2",
+    "xgboost>=2.1,<4",
+    "redis>=5,<7",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "httpx>=0.27,<1",
+    "pydantic>=2,<3",
+]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "fakeredis[lua]>=2.26,<3"]
+test = [
+    "pytest>=8,<10",
+    "fakeredis[lua]>=2.26,<3",
+    "ruff==0.14.0",
+]
 semantic = ["sentence-transformers>=3,<6"]
 
 [project.scripts]
@@ -23,3 +36,10 @@ timepredict = "timepredict.cli:main"
 [tool.hatch.build.targets.wheel]
 # src 布局：仅将 timepredict Python 包打入 wheel。
 packages = ["src/timepredict"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

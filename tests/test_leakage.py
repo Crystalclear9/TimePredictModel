@@ -1,5 +1,4 @@
 # 文件作用：防泄漏测试：语义向量不使用参数值，特征不引用标签，工作流不跨数据集合。
-import json
 
 from timepredict.features import FeatureSpec
 from timepredict.semantic import descriptor_text
@@ -34,9 +33,17 @@ def test_temporal_split_has_disjoint_workflows():
     for workflow in range(12):
         for call in range(2):
             start = float(workflow)
-            rows.append({"workflow": str(workflow), "workflow_start": start,
-                         "workflow_end": start + .1, "generation": f"{workflow}-{call}",
-                         "call": _call(call + 1), "lower": 1., "upper": 1.})
+            rows.append(
+                {
+                    "workflow": str(workflow),
+                    "workflow_start": start,
+                    "workflow_end": start + 0.1,
+                    "generation": f"{workflow}-{call}",
+                    "call": _call(call + 1),
+                    "lower": 1.0,
+                    "upper": 1.0,
+                }
+            )
     groups = split_rows(rows)
     sets = [{r["workflow"] for r in groups[name]} for name in ("train", "validation", "test")]
     assert not (sets[0] & sets[1] or sets[0] & sets[2] or sets[1] & sets[2])

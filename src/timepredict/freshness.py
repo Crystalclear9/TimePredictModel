@@ -1,5 +1,6 @@
 # 文件作用：读接口独立检查观察新鲜度；即使 worker 未发送移除通知，也不能继续使用过期候选。
 """Read-side liveness checks independent of the elected worker."""
+
 from .clock import elapsed
 
 PROCESSOR_TTL = 2.0
@@ -9,7 +10,7 @@ OBSERVER_TTL = 30.0
 def _proven_before(left, right):
     difference = elapsed(left, right)
     same_clock = (left["source"], left["boot"]) == (right["source"], right["boot"])
-    return difference >= (0. if same_clock else left["error"] + right["error"])
+    return difference >= (0.0 if same_clock else left["error"] + right["error"])
 
 
 def observation_failure(state, record):
@@ -19,7 +20,11 @@ def observation_failure(state, record):
             continue
         since, until = source.get("failure_since"), source.get("failure_until")
         try:
-            if since is not None and record.get("return") is not None and _proven_before(record["return"], since):
+            if (
+                since is not None
+                and record.get("return") is not None
+                and _proven_before(record["return"], since)
+            ):
                 continue  # Proven complete before this observer's uncertain interval.
         except ValueError:
             pass
@@ -41,29 +46,29 @@ def remaining_ttl(stamp, now, ttl):
 def observation_status(state, record, now):
     failure = observation_failure(state, record)
     if failure:
-        return failure, 0.
+        return failure, 0.0
     processor = state.get("processor")
     if not processor:
-        return "processor_unavailable", 0.
+        return "processor_unavailable", 0.0
     try:
         left = remaining_ttl(processor, now, PROCESSOR_TTL)
         if left <= 0:
-            return "processor_stale", 0.
+            return "processor_stale", 0.0
         source = state["sources"].get(record["out"]["source"] + "/" + record["out"]["boot"])
         if source and (source.get("bad") or source.get("lost")):
-            return "observation_lost", 0.
+            return "observation_lost", 0.0
         for source_state in state["sources"].values():
             if not source_state.get("retired") and not source_state.get("lost"):
                 source_remaining = remaining_ttl(source_state["last"], now, OBSERVER_TTL)
                 if source_remaining <= 0:
-                    return "source_stale", 0.
+                    return "source_stale", 0.0
                 left = min(left, source_remaining)
         source_left = remaining_ttl(source["last"] if source else record["out"], now, OBSERVER_TTL)
         agent_stamp = state.get("heartbeat_stamps", {}).get(record["key"], record["out"])
         agent_left = remaining_ttl(agent_stamp, now, OBSERVER_TTL)
         left = min(left, source_left, agent_left)
         if left <= 0:
-            return "observation_stale", 0.
-        return None, max(0., left)
+            return "observation_stale", 0.0
+        return None, max(0.0, left)
     except ValueError as exc:
-        return str(exc), 0.
+        return str(exc), 0.0

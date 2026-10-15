@@ -2,7 +2,7 @@
 
 复核日期：2026-10-15。交付范围为独立时间预测插件；外部C2密度、KV映射及加载策略由接入方实现。原始需求的收敛版本采用单工具串行、结构化GBDT/AFT基线及可选联合语义对照。
 
-当前源码与独立安装的wheel均通过344项本地测试，未将同一套用例重复计数。通过范围支持接口开发与联调，不代表零缺陷或生产就绪。以往逐轮复核记录可从Git历史查阅，本文件保留当前结论和必要限制。
+当前源码与独立安装的wheel均通过360项本地测试，未将同一套用例重复计数。通过范围支持接口开发与联调，不代表零缺陷或生产就绪。以往逐轮复核记录可从Git历史查阅，本文件保留当前结论和必要限制。
 
 ## 要求到实现与证据
 
@@ -27,12 +27,15 @@
 
 ## 本轮发现与修复
 
-本轮复核新增11项测试；其中两项故障反例在修复前失败：
+本轮新增16项测试，其中10项在修复前失败，其他6项保护原有拒绝行为：
 
-- 归档维护原先只核对archive_id，可能把删掉segment引用、但身份仍匹配的索引重新发布为有效目录。现在维护和读取都核对Redis标记绑定的索引摘要，拒绝重签损坏目录。
-- 暂停中的旧任务失去租约后，原先仍可能覆盖新任务已发布的固定索引文件，导致标记与磁盘目录不一致。现在每次尝试写独立不可变索引，仅有租约的提交可切换Redis标记；旧任务的本地写入不影响新版本。
+- 事件信封原先允许嵌套字段或键包含孤立Unicode代理码点，可能将编码错误带入历史/来源摘要处理。现在解析后整体严格UTF-8重编码，拒绝这些输入。
+- 原JSON解析器接受重复字段并静默取最后值。现在事件各层对象拒绝重复JSON键，不把有歧义的信封当有效观察。
+- Pydantic的Literal[True]原先也接受1和1.0。管理确认字段现在先检查对象确为True，再进行模型校验，非JSON布尔true返回422。
 
-其他新增检查覆盖旧固定索引的校验迁移，以及有/无归档目录时对null、false、空对象、数组标记的拒绝。归档专项共18项，使用真实临时文件和fakeredis/Lua模拟接管，不代表已完成跨主机文件系统故障验收。
+显式声明Pydantic 2运行依赖，避免依赖解析允许旧主版本却无法运行现有接口代码。归档专项18项继续覆盖不可变索引、损坏索引拒绝重签、旧任务接管、旧目录迁移及非法标记；不代表跨主机文件系统已验收。
+
+固定Ruff 0.14.0，使用Python 3.11、目标行宽100及E4/E7/E9/F规则。初检35项问题中，32项为同一行多语句，3项为测试未用导入，现均通过。56个Python文件中55个统一格式；格式化前后全部56个文件AST相同，之后另行删除3个未用导入并更新统一验证脚本。纯格式调整不等于逻辑验证，逻辑改动仍由测试单独覆盖。
 
 前轮六类修复仍由测试保护：
 
@@ -66,6 +69,8 @@
 ```bash
 uv sync --extra test
 uv run --extra test python scripts/verify_plugin.py
+uv run --extra test ruff check src tests scripts deploy examples
+uv run --extra test ruff format --check src tests scripts deploy examples
 uv run python scripts/verify_sglang_patch.py
 uv run python -m compileall -q src tests scripts deploy examples
 uv lock --check
@@ -73,7 +78,7 @@ uv lock --check
 
 本地证据写入`outputs/plugin-verification.json`并绑定源码SHA256，明确包含`server_acceptance_verified=false`和`production_publish_allowed=false`。Redis流、事务与租约使用fakeredis/Lua；发布门禁使用明确模拟验收夹具；Agent示例使用httpx.MockTransport。POSIX同步故障是模拟系统调用，Windows未验证目录fsync。
 
-补丁检查下载固定commit的三个上游文件，核对摘要、实际应用补丁并检查语法，不导入GPU服务。构建检查包含wheel/sdist；独立wheel环境从site-packages导入插件后运行同一套344项测试，示例文件仍由工作区提供。构建及缓存放在临时目录，不作为源代码提交。
+补丁检查下载固定commit的三个上游文件，核对摘要、实际应用补丁并检查语法，不导入GPU服务。构建检查包含wheel/sdist；独立wheel环境从site-packages导入插件后运行同一套360项测试，示例文件仍由工作区提供。构建及缓存放在临时目录，不作为源代码提交。
 
 ## 尚需目标环境验收
 

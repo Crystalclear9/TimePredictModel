@@ -1,5 +1,6 @@
 # 文件作用：有界滚动延迟样本统计；分位数来自保留窗口，总 count 单独累计。
 """Bounded histograms for process and end-to-end latency (seconds)."""
+
 from collections import defaultdict, deque
 import math
 
@@ -24,7 +25,13 @@ class Histograms:
             ordered = sorted(values)
             if not ordered:
                 continue
-            output[name] = {"count": self.counts[name], "retained": len(ordered),
-                            **{f"p{q}": ordered[min(len(ordered)-1, int((len(ordered)-1)*q/100))] for q in (50, 90, 99)},
-                            "max": ordered[-1]}
+            output[name] = {
+                "count": self.counts[name],
+                "retained": len(ordered),
+                **{
+                    f"p{q}": ordered[min(len(ordered) - 1, int((len(ordered) - 1) * q / 100))]
+                    for q in (50, 90, 99)
+                },
+                "max": ordered[-1],
+            }
         return output

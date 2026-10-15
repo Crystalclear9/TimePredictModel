@@ -1,4 +1,5 @@
 """Attach this consumer to your existing C2 scheduler; it does not perform KV loading."""
+
 import argparse
 import asyncio
 import json
@@ -26,8 +27,8 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--predictor", default="http://127.0.0.1:8098")
-    parser.add_argument("--horizon", type=float, default=2.)
-    parser.add_argument("--interval", type=float, default=.1)
+    parser.add_argument("--horizon", type=float, default=2.0)
+    parser.add_argument("--interval", type=float, default=0.1)
     args = parser.parse_args()
     if args.horizon <= 0 or args.interval <= 0:
         parser.error("horizon and interval must be positive")

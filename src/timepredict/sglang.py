@@ -1,5 +1,6 @@
 # 文件作用：固定 SGLang 版本的采集适配层：观察请求与工具响应，不在 GPU 推理进程中预测模型。
 """Optional SGLang v0.5.19 hooks. No model inference happens here."""
+
 import hashlib
 import json
 import logging
@@ -35,7 +36,8 @@ def safe_hook(function):
             observer.emit("gap")
         finally:
             if hasattr(observer, "record_overhead"):
-                observer.record_overhead(function.__name__, time.perf_counter()-started)
+                observer.record_overhead(function.__name__, time.perf_counter() - started)
+
     return wrapped
 
 
@@ -78,7 +80,11 @@ class Capture:
                 index = tool.get("index", offset)
                 current = self.calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
                 fun = tool.get("function") or {}
-                for field, value in (("id", tool.get("id")), ("name", fun.get("name")), ("arguments", fun.get("arguments"))):
+                for field, value in (
+                    ("id", tool.get("id")),
+                    ("name", fun.get("name")),
+                    ("arguments", fun.get("arguments")),
+                ):
                     if value:
                         combined = current[field] + value if stream else value
                         if len(combined.encode("utf-8")) > 256 * 1024:
@@ -96,15 +102,24 @@ class Capture:
             self.reason = "unsupported_multi_tool"
         call = next(iter(self.calls.values()))
         definition = self.tools.get(call["name"], {})
-        call = {**call, "description": definition.get("description", ""), "schema": definition.get("parameters", {})}
+        call = {
+            **call,
+            "description": definition.get("description", ""),
+            "schema": definition.get("parameters", {}),
+        }
         try:
             # Bound expensive feature validation to the CPU service; check completeness here.
             if not call["name"] or not isinstance(json.loads(call["arguments"]), dict):
                 self.reason = self.reason or "incomplete_arguments"
         except (ValueError, TypeError, RecursionError):
             self.reason = self.reason or "incomplete_arguments"
-        return {**self.identity, "call": call, "reason": self.reason,
-                "source_kind": "sglang", "serial_protocol": self.reason is None}
+        return {
+            **self.identity,
+            "call": call,
+            "reason": self.reason,
+            "source_kind": "sglang",
+            "serial_protocol": self.reason is None,
+        }
 
 
 # 在上游认证/校验之后采集 ingress，tenant 由已认证 Bearer key 的 SHA-256 派生。
@@ -119,7 +134,11 @@ def accepted(request, raw_request):
     if not getattr(serving.tokenizer_manager.server_args, "api_key", None):
         return
     headers = raw_request.headers
-    identity = {"workflow_id": headers.get("x-workflow-id"), "agent_id": headers.get("x-agent-id"), "request_id": headers.get("x-request-id")}
+    identity = {
+        "workflow_id": headers.get("x-workflow-id"),
+        "agent_id": headers.get("x-agent-id"),
+        "request_id": headers.get("x-request-id"),
+    }
     if not all(identity.values()):
         return
     # Only authenticated deployments are enabled. Tenant comes from the validated credential.
@@ -128,13 +147,27 @@ def accepted(request, raw_request):
         return
     identity["tenant"] = hashlib.sha256(credential[7:].encode()).hexdigest()
     data = request.model_dump(exclude_none=True)
-    tools = {t["function"]["name"]: t["function"] for t in data.get("tools", []) if t.get("type") == "function"}
-    capture = Capture(identity, tools, data.get("n", 1) == 1 and data.get("parallel_tool_calls", False) is False)
+    tools = {
+        t["function"]["name"]: t["function"]
+        for t in data.get("tools", [])
+        if t.get("type") == "function"
+    }
+    capture = Capture(
+        identity, tools, data.get("n", 1) == 1 and data.get("parallel_tool_calls", False) is False
+    )
     state["timepredict_capture"] = capture
     latest_ids, ids_present = latest_tool_result(data.get("messages", []))
-    observer.emit("ingress", {**identity, "latest_tool_ids": latest_ids,
-                                "tool_call_ids_present": ids_present, "source_kind": "sglang",
-                                "serial_protocol": capture.reason is None}, state["timepredict_received"])
+    observer.emit(
+        "ingress",
+        {
+            **identity,
+            "latest_tool_ids": latest_ids,
+            "tool_call_ids_present": ids_present,
+            "source_kind": "sglang",
+            "serial_protocol": capture.reason is None,
+        },
+        state["timepredict_received"],
+    )
 
 
 # 从非流式模型响应对象读取完整工具调用。
@@ -160,7 +193,7 @@ async def observe_stream(generator, raw_request):
                         capture.reason = "invalid_stream"
         observer = raw_request.scope.get("state", {}).get("timepredict_observer")
         if observer and hasattr(observer, "record_overhead"):
-            observer.record_overhead("stream_chunk", time.perf_counter()-started)
+            observer.record_overhead("stream_chunk", time.perf_counter() - started)
         yield chunk
 
 
@@ -179,7 +212,11 @@ class ObservationMiddleware:
         if scope["type"] == "lifespan":
             if self.redis_url and self.publisher is None:
                 redis = Redis.from_url(self.redis_url, decode_responses=True, socket_timeout=2)
-                self.publisher = Publisher(redis, Clock(source_id=self.source_id), os.environ.get("TIMEPREDICT_PREFIX", "timepredict") + ":events")
+                self.publisher = Publisher(
+                    redis,
+                    Clock(source_id=self.source_id),
+                    os.environ.get("TIMEPREDICT_PREFIX", "timepredict") + ":events",
+                )
                 self.publisher.start()
             try:
                 await self.app(scope, receive, send)
@@ -201,11 +238,21 @@ class ObservationMiddleware:
             nonlocal streaming, success
             if message["type"] == "http.response.start":
                 success = message["status"] == 200
-                streaming = any(k.lower() == b"content-type" and b"text/event-stream" in v for k, v in message.get("headers", []))
+                streaming = any(
+                    k.lower() == b"content-type" and b"text/event-stream" in v
+                    for k, v in message.get("headers", [])
+                )
             capture = state.get("timepredict_capture")
-            terminal = success and capture and message["type"] == "http.response.body" and (
-                any(line == b"data: [DONE]" for line in message.get("body", b"").splitlines())
-                if streaming else not message.get("more_body", False))
+            terminal = (
+                success
+                and capture
+                and message["type"] == "http.response.body"
+                and (
+                    any(line == b"data: [DONE]" for line in message.get("body", b"").splitlines())
+                    if streaming
+                    else not message.get("more_body", False)
+                )
+            )
             stamp = self.publisher.clock.stamp() if terminal else None
             if terminal and capture and not state.get("timepredict_prepared"):
                 prepared = capture.payload()
@@ -228,7 +275,7 @@ class ObservationMiddleware:
                     self.publisher.emit("out", payload, stamp)
                 capture.completed = True
                 if hasattr(self.publisher, "record_overhead"):
-                    self.publisher.record_overhead("out", time.perf_counter()-started)
+                    self.publisher.record_overhead("out", time.perf_counter() - started)
 
         try:
             await self.app(scope, receive, wrapped_send)
@@ -245,11 +292,17 @@ def install(app, server_args):
     if os.environ.get("TIMEPREDICT_REDIS_URL"):
         worker_count = getattr(server_args, "tokenizer_worker_num", None)
         if worker_count != 1:
-            raise ValueError("timepredict requires one authenticated HTTP worker per replica; deploy multiple replicas for multiple ingress")
+            raise ValueError(
+                "timepredict requires one authenticated HTTP worker per replica; deploy multiple replicas for multiple ingress"
+            )
         source_id = os.environ.get("TIMEPREDICT_OBSERVER_ID")
         if not source_id:
             port = getattr(server_args, "port", None)
             if port is None:
-                raise ValueError("timepredict requires TIMEPREDICT_OBSERVER_ID or a stable HTTP port")
-            source_id = f"{socket.gethostname()}:sglang:{getattr(server_args, 'host', '0.0.0.0')}:{port}"
+                raise ValueError(
+                    "timepredict requires TIMEPREDICT_OBSERVER_ID or a stable HTTP port"
+                )
+            source_id = (
+                f"{socket.gethostname()}:sglang:{getattr(server_args, 'host', '0.0.0.0')}:{port}"
+            )
         app.add_middleware(ObservationMiddleware, source_id=source_id)

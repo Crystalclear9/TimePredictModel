@@ -154,6 +154,17 @@ SDK只为当前候选保留计时信息，版本索引按业务键保留，不�
 
 后续开发的接口入口、扩展约束和验收顺序见[接入文档的开发交接部分](docs/integration.md#后续开发交接)。
 
+## 开发检查
+
+`uv sync --extra test`安装固定版本Ruff和测试工具。`uv run --extra test python scripts/verify_plugin.py`统一执行静态检查、格式检查和测试，并生成本地证据。单独修正格式使用：
+
+```bash
+uv run --extra test ruff format src tests scripts deploy examples
+uv run --extra test ruff check src tests scripts deploy examples
+```
+
+规则在`pyproject.toml`：Python 3.11、目标行宽100、E4/E7/E9/F检查；长字符串和注释不强制截断。运行依赖显式要求Pydantic 2。源代码格式也参与training_signature，升级后周期任务可能重新训练；这不表示特征契约发生变化。
+
 ## 目标环境验收
 
 `deploy/benchmark_server.py` 比较固定工具负载下采集前后的服务开销并验证流式/非流式与跨入口关联；`deploy/verify_failover.py` 在专用部署执行操作者指定的停止命令并检查接管；`deploy/benchmark_scale.py` 在独立 Redis prefix 下测量状态事务、有效候选分布计算、内存及离线评估开销。各脚本使用 `--help` 查看参数。

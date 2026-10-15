@@ -42,25 +42,39 @@ class LogNormal:
             return math.exp(log_total) if age == 0 else age * math.expm1(log_total - math.log(age))
 
         try:
-            shifted = 0.0 if age == 0 else float(log_ndtr((self.mu + self.sigma**2 - math.log(age)) / self.sigma))
+            shifted = (
+                0.0
+                if age == 0
+                else float(log_ndtr((self.mu + self.sigma**2 - math.log(age)) / self.sigma))
+            )
             log_mean = self.mu + self.sigma**2 / 2 + shifted - ls
             mean = math.exp(log_mean) if age == 0 else age * math.expm1(log_mean - math.log(age))
             p50, p90 = quantile(0.5), quantile(0.9)
-            log_tail_ratio = self.log_survival(age+horizon)-ls
+            log_tail_ratio = self.log_survival(age + horizon) - ls
             within = -math.expm1(log_tail_ratio)
             if horizon <= p50:
                 # The integrand stays >= 1/2 here. Normalize the interval so
                 # absolute integration tolerances also work for tiny horizons.
-                capped = horizon*quad(lambda v: math.exp(self.log_survival(age+horizon*v)-ls),
-                                      0., 1., epsabs=1e-10, epsrel=1e-10)[0]
+                capped = (
+                    horizon
+                    * quad(
+                        lambda v: math.exp(self.log_survival(age + horizon * v) - ls),
+                        0.0,
+                        1.0,
+                        epsabs=1e-10,
+                        epsrel=1e-10,
+                    )[0]
+                )
             else:
                 # A single integral over [0,H] can miss all probability mass
                 # when microsecond calls are capped at seconds. Use the exact
                 # truncated first moment, with stable differences in log space.
-                shifted_end = float(log_ndtr((self.mu+self.sigma**2-math.log(age+horizon))/self.sigma))
-                fraction = -math.expm1(shifted_end-shifted)
-                moment = math.exp(log_mean+math.log(fraction)) if fraction > 0 else 0.
-                capped = math.fsum((moment, -age*within, horizon*math.exp(log_tail_ratio)))
+                shifted_end = float(
+                    log_ndtr((self.mu + self.sigma**2 - math.log(age + horizon)) / self.sigma)
+                )
+                fraction = -math.expm1(shifted_end - shifted)
+                moment = math.exp(log_mean + math.log(fraction)) if fraction > 0 else 0.0
+                capped = math.fsum((moment, -age * within, horizon * math.exp(log_tail_ratio)))
             capped = min(capped, horizon, mean)
             if capped <= 0:
                 raise ValueError("nonpositive_capped_cost")
