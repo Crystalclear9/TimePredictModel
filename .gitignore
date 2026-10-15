@@ -1,21 +1,20 @@
-# 本地环境、缓存和构建产物。
+# 本地环境、缓存、构建产物和凭据。
 .venv/
 __pycache__/
 .pytest_cache/
 *.egg-info/
-artifacts/
-vendor/
 dist/
 .env
+tokens.json
+service.env
 # 原始采集数据、候选模型、正式模型与运行证据不提交到版本库。
 events.jsonl
 samples.jsonl
 candidates/
 models/
-holdout-candidates/
+training/
+ablation/
 server-acceptance.json
 scale-acceptance.json
 outputs/
-outputs/.wsl-evidence.json
-experiment-cache/
 failover.json

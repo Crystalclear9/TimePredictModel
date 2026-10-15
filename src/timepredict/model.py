@@ -1,4 +1,4 @@
-# 文件作用：统一模型加载/预测入口与 AFT 候选打包；直接回归包转交 RegressionModel。
+# 文件作用：AFT 模型加载/预测入口与不可变候选打包。
 import hashlib
 import json
 import math
@@ -53,13 +53,7 @@ class Model:
             root = root / pointer.read_text(encoding="utf-8").strip()
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         if manifest.get("model_type") == "xgboost_direct_log_time":
-            if require_promoted:
-                raise ValueError("direct_quantile_package_not_production_releasable")
-            from .regression import RegressionModel
-            self._regression = RegressionModel(root)
-            self.version = manifest.get("package_version", 1)
-            self.prediction_mode = "direct_quantiles_uncalibrated"
-            return
+            raise ValueError("direct_quantile_package_not_supported; retrain with survival:AFT")
         self.distribution_calibrated = False
         self.acceptance_expires_at = 0.0
         if (root / "promotion.json").exists():
@@ -115,7 +109,7 @@ class Model:
         if self.booster.num_features() != expected:
             raise ValueError("feature_dimension_mismatch")
 
-    # 直接回归返回未校准的 P50/P90；AFT 返回 mu/sigma，输入不支持时返回状态原因。
+    # AFT 返回 mu/sigma，输入不支持时返回状态原因。
     def _aft_prediction(self, mu, sigma, unknown_tool=False):
         from .distribution import LogNormal
         try:
@@ -133,19 +127,8 @@ class Model:
                 "unknown_tool": unknown_tool}, "ready"
 
     def predict(self, call):
-        if not hasattr(self, "_regression") and self.distribution_calibrated and time.time() > self.acceptance_expires_at:
+        if self.distribution_calibrated and time.time() > self.acceptance_expires_at:
             return None, "model_acceptance_expired"
-        if hasattr(self, "_regression"):
-            try:
-                p50, p90 = self._regression.quantiles(call)
-                if not (math.isfinite(float(p50)) and math.isfinite(float(p90)) and p50 > 0 and p90 >= p50):
-                    return None, "nonfinite_prediction"
-                return {"model_version": str(self.version), "p50_seconds": float(p50),
-                        "p90_seconds": float(p90), "prediction_mode": self.prediction_mode,
-                        "distribution_calibrated": False,
-                        "unknown_reason": "distribution_not_calibrated"}, "ready"
-            except ValueError as exc:
-                return None, str(exc)
         try:
             call = self.action_families.enrich(call) if self.action_families else call
             row = self.spec.transform(call)
@@ -175,6 +158,14 @@ def publish(root, booster, spec, sigma, best_iteration, report, action_families=
     version = hashlib.sha256(model_bytes + canonical({"report": report, "features": spec.to_dict(), "sigma": sigma,
                                                     "best_iteration": best_iteration, "dependencies": versions()}).encode()).hexdigest()[:16]
     target = root / version
+    if target.exists():
+        try:
+            if Model(target).version != version:
+                raise ValueError("candidate_version_mismatch")
+        except (OSError, ValueError, KeyError, TypeError):
+            # Retraining can reproduce the same content address. Preserve a
+            # damaged package for diagnosis instead of silently reusing it.
+            target.rename(root / f".invalid-{version}-{time.time_ns()}")
     if not target.exists():
         stage = Path(tempfile.mkdtemp(prefix=".staging-", dir=root))
         booster.save_model(stage / "model.ubj")

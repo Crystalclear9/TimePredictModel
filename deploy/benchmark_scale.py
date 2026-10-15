@@ -8,7 +8,6 @@ import asyncio
 import json
 import math
 import platform
-import resource
 import time
 import uuid
 from pathlib import Path
@@ -42,8 +41,10 @@ async def run(args):
             state["processor"] = stamp
             for record in state["records"].values():
                 record["prediction_status"] = "ready"
-                # 该夹具未带 distribution_calibrated；按当前 window_rows 会降级 unknown，使 ready_rows 验收失败。
-                record["prediction"] = {"mu": math.log(3), "sigma": .5, "model_version": "synthetic-scale"}
+                # Fixture-only calibration enables the real distribution math under load.
+                # This private prefix and capacity report cannot authorize production.
+                record["prediction"] = {"mu": math.log(3), "sigma": .5, "model_version": "synthetic-scale",
+                                        "distribution_calibrated": True}
             await redis.set(store.state_key, json.dumps(state))
             latencies = []
             sem = asyncio.Semaphore(args.concurrency)
@@ -73,13 +74,18 @@ async def run(args):
         rows = [{"lower": 1.+i % 10, "upper": math.inf if i % 5 == 0 else 1.+i % 10} for i in range(args.training_rows)]
         started = time.perf_counter()
         evaluate(rows, np.full(len(rows), math.log(3)), .5)
+        try:
+            import resource
+            peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        except ImportError:
+            peak_rss = None  # Portable fixture tests; the actual CLI requires Linux.
         result = {"kind": "scale_acceptance", "host": platform.platform(), "created_at": time.time(), "online": reports,
                   "offline": {"rows": len(rows), "evaluation_seconds": time.perf_counter()-started,
-                              "process_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss},
+                              "process_peak_rss_kib": peak_rss},
                   "budgets": {"max_mutate_p99_seconds": args.max_mutate_p99, "max_state_bytes": args.max_state_bytes, "max_window_seconds": args.max_window_seconds},
                   "passed": all(r["passed"] for r in reports),
                   "limits": "CAS document contains active and retained metadata. Repeat with representative retention/arguments before capacity commitment; no GPU throughput claim."}
-        Path(args.output).write_text(json.dumps(result, indent=2))
+        Path(args.output).write_text(json.dumps(result, indent=2), encoding="utf-8")
         print(json.dumps(result, indent=2))
         return result["passed"]
     finally:

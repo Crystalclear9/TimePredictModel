@@ -319,6 +319,21 @@ def test_periodic_training_stable_cutoff_and_lease(tmp_path, monkeypatch):
                                serving_dir=None, evidence=None, policy=None, rounds=3, threads=1,
                                feature_mode="structured", holdout_tool=[])
         first = await retrain_once(args)
+        candidate = tmp_path/"candidates"/first["version"]
+        candidate.rename(tmp_path/"saved-candidate")
+        recovered = await retrain_once(args)
+        assert recovered["status"] == "candidate_trained" and candidate.is_dir()
+        (candidate/"features.json").write_text("damaged package", encoding="utf-8")
+        repaired = await retrain_once(args)
+        assert repaired["status"] == "candidate_trained"
+        assert Model(candidate).predict({"name": "search", "arguments": "{}"})[1] == "ready"
+        assert list((tmp_path/"candidates").glob(".invalid-*"))
+        manifest_path = candidate/"manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = "different-package"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        assert (await retrain_once(args))["status"] == "candidate_trained"
+        assert Model(candidate).version == first["version"]
         second = await retrain_once(args)
         assert first["status"] == "candidate_trained" and second["status"] == "unchanged"
         assert first["version"] == second["version"]

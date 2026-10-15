@@ -84,8 +84,6 @@ class Capture:
                 fun = tool.get("function") or {}
                 for field, value in (("id", tool.get("id")), ("name", fun.get("name")), ("arguments", fun.get("arguments"))):
                     if value:
-                        if field in ("id", "name") and current[field] == value:
-                            continue
                         combined = current[field] + value if stream else value
                         if len(combined.encode("utf-8")) > 256 * 1024:
                             self.reason = "unsupported_input"

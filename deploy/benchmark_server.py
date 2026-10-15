@@ -78,7 +78,7 @@ def clock_ok(health):
 
 # 预热并交替测试两组部署，以 Redis 闭合记录和遥测构建 server_acceptance 证据。
 async def run(args):
-    payloads = [json.loads(line) for line in Path(args.requests).read_text().splitlines() if line.strip()]
+    payloads = [json.loads(line) for line in Path(args.requests).read_text(encoding="utf-8").splitlines() if line.strip()]
     if not payloads or any(not p.get("tools") for p in payloads):
         raise ValueError("each workload row must define a tool and messages")
     auth = {"Authorization": "Bearer "+os.environ["SGLANG_API_KEY"]}
@@ -184,7 +184,7 @@ async def run(args):
         drops.append(telemetry.get("dropped"))
     for sample in health_samples:
         queues += [s.get("telemetry", {}).get("queue_depth", 0) for s in sample.get("sources", {}).values()]
-    failover = json.loads(Path(args.failover_evidence).read_text()) if args.failover_evidence else {}
+    failover = json.loads(Path(args.failover_evidence).read_text(encoding="utf-8")) if args.failover_evidence else {}
     checks = {"sglang_nonstream": mode_pass(False), "sglang_stream": mode_pass(True),
               "prediction_observed": before.get("model_version") == after.get("model_version") and bool(after.get("model_version")) and
                   any(r.get("prediction", {}) and r["prediction"].get("model_version") == after.get("model_version") for r in records),
@@ -205,7 +205,7 @@ async def run(args):
               "prediction_status_counts": {status: sum(r["prediction_status"] == status for r in records) for status in {r["prediction_status"] for r in records}},
               "failover": failover, "host": platform.platform(),
               "scope": "Fixed-delay synthetic tool workload; no accuracy or KV benefit claim. Identical baseline hardware/model/config required."}
-    Path(args.output).write_text(json.dumps(result, indent=2))
+    Path(args.output).write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps({"checks": checks, "metrics": metrics}, indent=2))
     return all(checks.values()) and metrics["request_errors"] == 0
 

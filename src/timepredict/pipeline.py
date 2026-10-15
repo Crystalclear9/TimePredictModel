@@ -133,7 +133,15 @@ async def retrain_once(args):
                 result.update(status="waiting_for_data", reason="train/validation require completed returns")
                 atomic_json(previous_path, result)
                 return result
-            if previous.get("data_digest") == digest and previous.get("settings") == settings and previous.get("version"):
+            reuse = previous.get("data_digest") == digest and previous.get("settings") == settings and previous.get("version")
+            if reuse:
+                try:
+                    cached = await asyncio.to_thread(Model, output/"candidates"/previous["version"])
+                    if cached.version != previous["version"]:
+                        raise ValueError("cached_candidate_version_mismatch")
+                except (OSError, ValueError, KeyError, TypeError):
+                    reuse = False
+            if reuse:
                 version = previous["version"]
                 result.update(status="unchanged", version=version)
             else:

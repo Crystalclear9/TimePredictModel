@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def verify():
-    manifest = json.loads((ROOT/"patches/sglang-v0.5.19.json").read_text())
+    manifest = json.loads((ROOT/"patches/sglang-v0.5.19.json").read_text(encoding="utf-8"))
     checked = {}
     with tempfile.TemporaryDirectory(prefix="timepredict-patch-") as directory:
         target = Path(directory).resolve()

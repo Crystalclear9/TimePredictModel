@@ -69,7 +69,7 @@ async def run(args):
                   "prefix": args.prefix, "model_version": before["model_version"], "before_processor": old,
                   "after_processor": recovered.get("processor") if recovered else None,
                   "recovery_seconds": time.monotonic()-started, "post_failover_event_consumed": consumed}
-        Path(args.output).write_text(json.dumps(result, indent=2))
+        Path(args.output).write_text(json.dumps(result, indent=2), encoding="utf-8")
         print(json.dumps(result, indent=2))
     await redis.aclose()
     return result["passed"]

@@ -51,7 +51,7 @@ def _curve_svg(series, title):
 
 # 只回放截取前发生且已观测事件；完整返回产生精确标签，完整观察等待产生右删失。
 def snapshot(events, cutoff, heartbeat_ttl=30, cutoff_stamp=None):
-    if not math.isfinite(cutoff) or heartbeat_ttl <= 0:
+    if not math.isfinite(cutoff) or not math.isfinite(heartbeat_ttl) or heartbeat_ttl <= 0:
         raise ValueError("cutoff must be finite and heartbeat TTL positive")
     events = list(events)
     evidence_events = {e["event_id"]: e for e in events}
@@ -113,6 +113,20 @@ def snapshot(events, cutoff, heartbeat_ttl=30, cutoff_stamp=None):
             evidence["observation"] = [e for e in events if e["kind"] in ("heartbeat", "source_heartbeat")
                                        and cutoff - heartbeat_ttl <= e["stamp"]["utc"] <= cutoff
                                        and e.get("observed_at", e["stamp"]["utc"]) <= cutoff]
+            # A recent OUT or another source's heartbeat cannot prove that this
+            # observer remained live. Export only evidence the trainer can verify.
+            observations = [e for e in evidence["observation"] if not e["stamp"].get("jumped")
+                            and e["stamp"].get("error") is not None
+                            and math.isfinite(e["stamp"]["error"]) and 0 <= e["stamp"]["error"] <= .0025]
+            source_seen = any(e["kind"] == "source_heartbeat" and
+                              all(e["stamp"].get(k) == record["out"].get(k) for k in ("source", "boot"))
+                              for e in observations)
+            agent_seen = any(e["kind"] == "heartbeat" and
+                             all(e.get(k) == record.get(k) for k in ("tenant", "workflow_id", "agent_id"))
+                             for e in observations)
+            if not source_seen or not agent_seen:
+                excluded["missing_censoring_heartbeats"] += 1
+                continue
         evidence_digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
                                                     allow_nan=False).encode()).hexdigest()
         rows.append({"generation": record["generation"], "workflow": wf, "workflow_start": state["workflows"][wf]["start"],

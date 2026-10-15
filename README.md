@@ -2,7 +2,29 @@
 
 独立的工具回返时间预测插件。目标是 `T = t_return - t_out`：完整工具响应的服务端发送边界到后续请求的服务端入口，单位为秒，不包含续接排队或推理。
 
-本模块负责采集、关联、特征转换、AFT 训练、模型验收发布、条件剩余时间和窗口接口。外部模块负责 C2 密度评分、KV 节点映射、加载和收益评价。接入契约见 [INTEGRATION.md](INTEGRATION.md)。
+本模块负责采集、关联、特征转换、AFT 训练、模型验收发布、条件剩余时间和窗口接口。外部模块负责 C2 密度评分、KV 节点映射、加载和收益评价。
+
+当前状态：模块本地验收通过；真实 Redis、GPU SGLang、跨主机校时、语义编码器质量及生产性能仍需目标环境验收。完整检查范围见 [验证记录](docs/verification.md)，不能将本地通过解释为生产就绪。
+
+| 文档 | 内容 |
+|---|---|
+| [数据准备](docs/data.md) | 标签、采集、快照、时间划分和训练前检查 |
+| [接入契约](docs/integration.md) | API v1、Python 消费端、分布和候选租约 |
+| [验证记录](docs/verification.md) | 实现映射、本地检查、已修复问题和未验证项 |
+
+## 文件布局
+
+| 目录 | 保留内容 |
+|---|---|
+| `src/timepredict/` | 采集、状态机、特征、训练、发布、服务及客户端 |
+| `tests/` | 协议、数值、并发、训练、接口和故障回归测试 |
+| `patches/` | 固定 SGLang 补丁及上游摘要清单 |
+| `deploy/` | 服务和重训模板、Redis/Docker 配置、目标服务器验收脚本 |
+| `examples/` | Agent 和外部调度器接入示例 |
+| `scripts/` | 本地验收和固定补丁验证入口 |
+| `docs/` | 数据、接口和验证文档 |
+
+`outputs/` 仅保存本地生成的验证证据，不提交。`.venv/` 是本地运行环境。旧代理数据下载、直接分位数回归、合成回放及重复审计入口已移除；相关历史仍可从 Git 获取。旧直接回归模型需用 AFT 重训；既有 AFT v3/v4 特征包保留兼容加载。
 
 ## 实现约定
 
@@ -22,8 +44,11 @@ Python 3.11+：
 
 ```bash
 uv sync --extra test
-uv run pytest -q
+uv run --extra test python scripts/verify_plugin.py
+uv run python scripts/verify_sglang_patch.py
 ```
+
+第一项验证使用本地 CPU、fakeredis/Lua 和明确的模拟验收夹具，写入 `outputs/plugin-verification.json`。补丁验证需要联网下载三个固定上游文件，核对 SHA256、检查并实际应用补丁、验证修改后 Python 语法，写入 `outputs/sglang-patch-verification.json`；它不启动 GPU 服务。
 
 基线不需要 PyTorch 或嵌入权重。语义实验使用 `uv sync --extra semantic`，提前缓存 `sentence-transformers/all-MiniLM-L6-v2`，revision `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`；可设置 `TIMEPREDICT_EMBEDDING_CACHE`。在线只读本地模型，不临时下载。
 
@@ -51,9 +76,9 @@ uv run timepredict snapshot --events events.jsonl --cutoff UNIX_UTC_SECONDS --ou
 uv run timepredict train --data samples.jsonl --data-kind observed --feature-mode structured --output candidates
 ```
 
-正式样本携带关联方式、边界、原始事件及摘要。训练验证事件来源、调用内容、业务身份和真实时间差。数据需来自可信服务端；摘要用于一致性检查，不是来源认证签名。
+正式样本携带关联方式、边界、原始事件及摘要。训练验证事件来源、调用内容、业务身份和真实时间差。数据需来自可信服务端；摘要用于一致性检查，不是来源认证签名。模型与配置文件统一采用 UTF-8，支持中文工具名和参数字段。
 
-生成右删失样本时，截断时钟也必须有校时证据。手动快照可提供 `--cutoff-clock-error MEASURED_SECONDS`（误差范围0至0.0025秒，必须来自实际测量）；未提供时只保留完整返回，等待样本记为 `cutoff_clock_unverified` 并排除。周期重训自动读取本机校时状态；无校时证据时同样不制造删失标签。
+生成右删失样本时，截断时钟也必须有校时证据，并存在匹配来源/启动及 Agent 的新鲜心跳。普通 OUT 事件不能代替来源心跳。手动快照可提供 `--cutoff-clock-error MEASURED_SECONDS`（误差范围0至0.0025秒，必须来自实际测量）；未提供时只保留完整返回，等待样本记为 `cutoff_clock_unverified` 并排除。周期重训自动读取本机校时状态；无校时证据时同样不制造删失标签。
 
 训练输出模型、词典、sigma、最佳迭代、依赖版本、数据摘要、覆盖率、窗口/条件窗口校准、经验基线和曲线。训练不更新线上 CURRENT。
 
@@ -76,7 +101,7 @@ uv run timepredict retrain --output training --feature-mode structured
 uv run timepredict ablation --data samples.jsonl --data-kind observed --output ablation --holdout-tool unseen_tool
 ```
 
-retrain 固定历史流边界及UTC截断，在独立进程训练候选；可续租的 Redis 租约避免重叠训练，数据和配置不变则复用候选。`deploy/timepredict-train.service`、`deploy/timepredict-train.timer` 提供每小时模板。
+retrain 固定历史流边界及UTC截断，在独立进程训练候选；可续租的 Redis 租约避免重叠训练。数据和配置不变且候选包通过完整性加载检查时才复用；候选丢失或损坏时重新训练。`deploy/timepredict-train.service`、`deploy/timepredict-train.timer` 提供每小时模板。
 
 要验收后自动发布，同时提供 --serving-dir、--evidence、--policy；证据需匹配新版本。失败时保留线上模型并写入 training/last-run.json。模板默认仅训练候选。
 
@@ -96,8 +121,8 @@ ablation 共享数据、划分和训练预算，保存基线与增强的已知/�
 
 接口使用内部 Bearer token，按租户隔离。仅使用 ready、in_window、非shadow且未过期的候选；unknown不是零秒。`src/timepredict/client.py` 提供 Python 消费端，`examples/scheduler_client.py` 可接入既有调度器。断网时有效期仍由本地单调时钟执行。期望驻留成本从条件分布计算，不能以中位数代替。
 
-## 独立实验
+## 目标环境验收
 
-train-regression、evaluate、replay-generate、公开数据 experiment 保留为独立实验。直接P50/P90回归没有完整生存分布，不能正式发布；代理及合成回放不可生产发布。旧回放精度不代表新AFT基线真实精度。
+`deploy/benchmark_server.py` 比较固定工具负载下采集前后的服务开销并验证流式/非流式与跨入口关联；`deploy/verify_failover.py` 在专用部署执行操作者指定的停止命令并检查接管；`deploy/benchmark_scale.py` 在独立 Redis prefix 下测量状态事务、有效候选分布计算、内存及离线评估开销。各脚本使用 `--help` 查看参数。
 
-回放遵守Agent内串行调用，在时间划分间设置工作负载边界；t_return是模拟后续HTTP请求入口。它验证协议和训练契约，不证明真实SGLang性能或KV收益。
+容量脚本使用明确的模拟分布，输出 `scale_acceptance`，不能作为正式发布证据。服务器验收也不能代替真实日志上的预测质量和外部 KV 收益实验。发布门禁策略在 `deploy/gate-policy.json`，应按目标环境采集证据，不能填入假测量值。
